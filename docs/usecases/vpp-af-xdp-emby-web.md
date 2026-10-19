@@ -12,7 +12,7 @@
 - Codex app-server 当前使用 `--listen unix://`，只有 Unix socket。推荐让它只监听 `ws://127.0.0.1:8790`，本地通过 SSH 本地端口转发访问；这样 app-server 不需要单独做公网 punt，SSH 隧道本身就走在 punt 路径上。
 - `vpp-web` TUN 只属于“保留内核 TCP”的路线。Phase 1/2 都是 **external app（nginx VCL）+ internal app（VPP media plugin）**：客户端到 nginx、nginx 到 internal app 都走 VPP host stack，不需要 `vpp-web` TUN。只有 nginx -> 真实 Emby 的 `127.0.0.1:8096` 那一段仍是内核 loopback。
 - **当前优先 Phase 0：隔离 lab + 裸 HTTP internal app。** 独立 VPP 实例 + veth + `af_packet`，不碰现有 Caddy/Docker/Emby/`enp2s0f0`；AF_XDP 和 SSH punt 后置到 Phase 3。
-- 推荐顺序：Phase 0 隔离 lab + 裸 HTTP 验证 -> Phase 1 lab 内混合路由（nginx VCL + VPP internal app，纯 HTTP，SSH 隧道）-> Phase 2 同一套接到公网（TLS + `pornvpp.linqiankai.top` + 停 Caddy）-> Phase 3 AF_XDP + 强制 SSH punt。
+- 推荐顺序：Phase 0 隔离 lab + 裸 HTTP 验证 -> Phase 1 本机 TUN 验证混合路由（nginx VCL + VPP internal app，纯 HTTP）-> Phase 2 同一套接到公网（TLS + `pornvpp.linqiankai.top` + 停 Caddy）-> Phase 3 AF_XDP + 强制 SSH punt。
 - `pornvpp.linqiankai.top` 的 A 记录已生效（`184.107.84.201`），Let's Encrypt HTTP-01 证书已签发：
   `/etc/letsencrypt/live/pornvpp.linqiankai.top/{fullchain.pem,privkey.pem}`，ECDSA，有效期到 2027-01-17；Caddy 已恢复。
 - Phase 0/1 的 lab 构建实测插件集：`af_packet,tap,http,http_static`（`./configure -P af_packet,tap,http,http_static -D none -S none -E none`），已包含 `vppctl` 和 VCL 库（`libvcl_ldpreload.so`）。Phase 3 再切 `af_xdp`，并补 `linux_cp/linux_nl/nat`。
@@ -169,7 +169,7 @@ control sock /root/.codex/app-server-control/app-server-control.sock
 **这是一套新的隔离环境，不迁移、不改动现有 Caddy/Docker/Emby。**
 
 1. **Phase 0**：隔离 lab 环境。用独立 VPP 实例 + veth/测试接口 + `af_packet`（或 Linux-CP）把链路跑通；不动 `enp2s0f0` 上的现有服务。
-2. **Phase 1**：lab 内验证混合路由。external nginx（VCL/LDP）+ VPP internal media app，入口是 lab 地址 + **裸 HTTP**；Emby 客户端通过 SSH 隧道访问。不动 WAN、不停 Caddy、不用证书。
+2. **Phase 1**：本机验证混合路由。external nginx（VCL/LDP）+ VPP internal media app，入口是 `tap` 插件的 TUN 接口 + **裸 HTTP**，在服务器本机用 curl 验证播放后端与路由。不动 WAN、不停 Caddy、不用证书。
 3. **Phase 2**：把 Phase 1 的同一套 nginx 和路由表接到公网入口：VPP 接管 `enp2s0f0`，域名 `pornvpp.linqiankai.top`，TLS 在 VPP host stack 上终止。功能代码与 Phase 1 完全相同，只改入口。
 4. **Phase 3**：`af_packet` 换成 AF_XDP；**SSH punt 必做**，不是可选。
 5. TCP 使用 BBR + RACK/TLP：Phase 0 的 Linux 侧用内核参数；Phase 1 的 VPP TCP 用 `tcp { cc-algo bbr rack }`。
@@ -237,27 +237,29 @@ ip netns exec vpp-client curl -v http://10.10.0.1:8080/health
 
 注意：Phase 0 **不使用 Linux-CP、不修改 enp2s0f0、不启停 Caddy/Docker/Emby**。Linux-CP 只作为后续在独立测试接口上的可选项，不碰现有 WAN。
 
-### 3.1 Phase 1：lab 内验证混合路由（API -> Emby，播放 -> VPP）
+### 3.1 Phase 1：本机 TUN 验证混合路由（API -> Emby，播放 -> VPP）
 
-Phase 1 只回答一个问题：**混合路由能不能让真实 Emby 客户端正常登录、浏览、播放，并且播放字节确实来自 VPP**。真实 Emby 只提供 API/元数据/鉴权，视频由 VPP internal media app 直接读文件返回。
+Phase 1 只回答一个问题：**混合路由和 VPP 播放能不能工作，并且播放字节确实来自 VPP**。真实 Emby 只提供 API/元数据/鉴权，视频由 VPP internal media app 直接读文件返回。
 
 Phase 1 的边界（与 Phase 2 的唯一区别就在这里）：
 
-- 入口是 lab 网络 + **纯 HTTP**，不开 TLS，不用域名。
+- 入口是 VPP 的 **`tap` 插件 TUN 接口**（`10.10.0.1`）+ **纯 HTTP**，只在本机测试，不开 TLS、不用域名。
 - **不碰 `enp2s0f0`**，WAN 地址仍由内核持有。
 - **Caddy 保持运行**，Docker Emby 保持不动，两个环境互不干扰。
 - 功能代码（nginx 混合路由 + VPP internal media app）在 Phase 2 原样复用，一行不改。
 
 ```text
-Emby Client (你的本地电脑)
-   |  SSH -L 8080:10.10.0.1:80
+本机 curl（源 10.10.0.2）
+   |  vpp-tun（内核 TUN 设备）
    v
+tap0 (VPP, TUN 模式, 10.10.0.1/24)
+   |
 nginx (external VCL, 纯 HTTP, 10.10.0.1:80)
    |-- API  --> 127.0.0.1:8096   (真实 Emby，内核 loopback)
    `-- 播放 --> 10.255.0.1:8080  (VPP internal media app)
 ```
 
-为什么 Phase 1 也要 nginx：Emby 客户端必须先登录、拿到 `PlaybackInfo` 才能点到播放 URL。没有 nginx 做混合路由，客户端连 API 都到不了真实 Emby。所以 Phase 1 和 Phase 2 的差别只在**入口**（HTTP/lab vs HTTPS/WAN），不在路由和播放实现。
+为什么 Phase 1 也要 nginx：Emby 客户端必须先登录、拿到 `PlaybackInfo` 才能点到播放 URL。没有 nginx 做混合路由，客户端连 API 都到不了真实 Emby。所以 Phase 1 和 Phase 2 的差别只在**入口**（TUN/HTTP vs WAN/HTTPS），不在路由和播放实现。
 
 路由规则：
 
@@ -281,7 +283,7 @@ upstream emby_api  { server 127.0.0.1:8096; keepalive 32; }
 upstream vpp_media { server 10.255.0.1:8080; keepalive 64; }
 
 server {
-    # Phase 1：只在 lab 地址上监听纯 HTTP
+    # Phase 1：只监听 TUN 地址，纯 HTTP
     listen 10.10.0.1:80;
 
     # Phase 2 换成公网 HTTPS 入口，其余配置不动：
@@ -330,7 +332,7 @@ nginx -g 'daemon off;'
 
 #### 3.1.1 播放后端：VPP internal media app
 
-目标：独立 VPP 实例 + veth + `af_packet`，VPP internal app 直接读 `/srv/media` 并提供 Range/HLS；现有 Caddy/Docker/Emby/`enp2s0f0` 全部不动。
+目标：独立 VPP 实例 + `tap` 插件 TUN 接口，VPP internal app 直接读 `/srv/media` 并提供 Range/HLS；现有 Caddy/Docker/Emby/`enp2s0f0` 全部不动。
 
 #### 构建
 
@@ -445,41 +447,38 @@ show session
 vppctl -s /run/vpp-lab/cli.sock
 ```
 
-#### 隔离链路
+#### 本地 TUN 链路（`tap` 插件）
 
-```bash
-ip netns add vpp-client
-ip link add vpp-lab type veth peer name vpp-lab-peer
-ip link set vpp-lab netns vpp-client
-ip link set vpp-lab-peer up
-ip netns exec vpp-client ip link set lo up
-ip netns exec vpp-client ip link set vpp-lab up
-ip netns exec vpp-client ip addr add 10.10.0.2/24 dev vpp-lab
+用 `tap` 插件的 TUN 模式，**不要**用旧的内核 tuntap 路径（`src/vnet/unix/tuntap.c`、`ip tuntap add` 或旧 `tapcli`）。这里用的是 tapv2 API 的 `TUN` 标志，L3 点对点，没有 MAC/ARP。
 
-# 内核侧也拿一个同网段地址，sshd 才能把本地端口转发到 nginx
-ip addr add 10.10.0.254/24 dev vpp-lab-peer
-```
-
-#### VPP 接口
+VPP 侧：
 
 ```text
-create host-interface name vpp-lab-peer
-set interface state host-vpp-lab-peer up
-set interface ip address host-vpp-lab-peer 10.10.0.1/24
+create tap id 0 if-name tap0 host-if-name vpp-tun tun host-mtu-size 1500
+set interface state tap0 up
+set interface ip address tap0 10.10.0.1/24
 
-# nginx 与 internal media app 之间的 VPP 内部地址，不出 VPP，不经内核
+# nginx 与 internal media app 之间的内部地址，纯 VPP，不经内核
 create loopback interface instance 0
 set interface state loopback0 up
 set interface ip address loopback0 10.255.0.1/32
+```
+
+内核侧（`vpp-tun` 由 VPP 创建，不要手工 `ip tuntap add`）：
+
+```bash
+ip link set vpp-tun up
+ip addr add 10.10.0.2/24 dev vpp-tun
+ip route get 10.10.0.1        # 应显示 dev vpp-tun
 ```
 
 地址分工：
 
 | 地址 | 谁在用 | 用途 |
 |---|---|---|
-| `10.10.0.1:80` | nginx（监听） | 客户端入口 |
+| `10.10.0.1:80` | nginx（监听） | 本机测试入口，经 `vpp-tun` 进来 |
+| `10.10.0.2` | 内核 `vpp-tun` | 本机测试源地址 |
 | `10.255.0.1:8080` | internal media app（绑 `0.0.0.0:8080`） | nginx 的播放 upstream，纯 VPP 内部 |
-| `10.10.0.254` | 内核 `vpp-lab-peer` | 给 SSH 端口转发用，不承载业务流量 |
 
 #### 启用 internal HTTP app
 
@@ -525,38 +524,30 @@ MVP 直接扩展 `src/plugins/http_static/`，新增 `media_server.c`：
 
 #### 验证
 
+全部在服务器本机执行，流量走 `vpp-tun` -> VPP：
+
 ```bash
 # 1. 直接打 internal media app（验证播放后端）
-ip netns exec vpp-client curl -sv http://10.10.0.1:8080/health
-ip netns exec vpp-client curl -sv -r 0-1023 http://10.10.0.1:8080/media/test.mp4 -o /tmp/part
-ip netns exec vpp-client curl -sv http://10.10.0.1:8080/hls/test/index.m3u8
+curl -sv http://10.10.0.1:8080/health
+curl -sv -r 0-1023 http://10.10.0.1:8080/media/test.mp4 -o /tmp/part
+curl -sv http://10.10.0.1:8080/hls/test/index.m3u8
 
 # 2. 经过 nginx（验证混合路由）
-ip netns exec vpp-client curl -sv http://10.10.0.1/System/Info/Public
-ip netns exec vpp-client curl -sv -r 0-1023 http://10.10.0.1/media/test.mp4 -o /tmp/part2
+curl -sv http://10.10.0.1/System/Info/Public
+curl -sv -r 0-1023 http://10.10.0.1/media/test.mp4 -o /tmp/part2
 
-# 3. 内核对这两个端口不应有监听（TCP 由 VPP 终止）
+# 3. 内核不应有 80/8080 的监听（TCP 由 VPP 终止）
 ss -ltnp | grep -E ':(80|8080) ' || echo 'no kernel listener'
+
+# 4. 确认流量确实进 VPP
+ip -s link show vpp-tun      # RX/TX 计数应增长
 ```
 
 `ping` 在这一版 VPP 里不通是正常的：ICMP echo 会被 `ip4-icmp-input` 送到 `ip4-punt`，而 Phase 1 没有 punt 回内核的通道。用 TCP 请求判断连通性即可。
 
-从你的本地电脑测试（SSH 端口转发，不占用 WAN 80/443）：
+Phase 1 **不做远程客户端测试**：入口不是 `enp2s0f0`，用 SSH 隧道把 lab 地址映射到本地只能证明 app 逻辑，证明不了真实入口。真实 Emby 客户端放到 Phase 2，直接连 `https://pornvpp.linqiankai.top`。
 
-```bash
-ssh -N -L 8080:10.10.0.1:80 root@184.107.84.201
-# 另一个终端
-curl -v http://127.0.0.1:8080/System/Info/Public
-curl -v -r 0-1023 http://127.0.0.1:8080/media/test.mp4 -o /tmp/part
-```
-
-Emby 客户端：添加服务器 `http://127.0.0.1:8080`，登录、浏览媒体库、播放一个 direct-play 兼容的视频。
-
-判定播放确实走了 VPP：
-
-- 播放时 `ss -tnp | grep 8096` 只应看到 nginx -> Emby 的 API 连接，不应出现视频流连接。
-- VPP `show session` 应能看到 `10.255.0.1:8080` 的播放会话。
-- `/Videos/*/stream`、`/Items/*/Download` 不应出现在 Emby 的访问日志里。
+如果 Phase 1 阶段就想用真实客户端验证一次 app 行为，可以临时 `ssh -L 8080:10.10.0.1:80 root@184.107.84.201`，但这只是方便，不作为验收依据。
 
 VPP 侧：
 
@@ -569,8 +560,8 @@ show session
 #### 回滚
 
 ```bash
-ip netns del vpp-client
-ip link del vpp-lab-peer 2>/dev/null || true
+# 在 VPP 内删除 tap，内核侧的 vpp-tun 会随之消失
+vppctl -s /run/vpp-lab/cli.sock delete tap tap0
 # 停掉独立 VPP lab 实例
 sysctl -w vm.nr_hugepages=0
 ```
@@ -584,7 +575,7 @@ Phase 2 **不改任何功能代码**，只把 Phase 1 的入口从 lab 换成公
 | 项目 | Phase 1 | Phase 2 |
 |---|---|---|
 | 监听 | `10.10.0.1:80`，纯 HTTP | `184.107.84.201:443`，TLS |
-| 域名 | 无，用 SSH 隧道 + `127.0.0.1` | `pornvpp.linqiankai.top` |
+| 域名 | 无，本机直连 `10.10.0.1` | `pornvpp.linqiankai.top` |
 | WAN 网卡 | 内核持有，不动 | VPP `af_packet` 绑 `enp2s0f0`，内核地址 flush |
 | Caddy | 保持运行，互不干扰 | 临时停止（同一 IP:443 冲突） |
 | nginx 配置 | 见 3.1 | 只改 `listen` / `server_name` / 证书三处 |
@@ -750,7 +741,7 @@ Phase 2 稳定后再做：
 
 ## 4. 地址与端口规划
 
-> 本节及第 5、6 节是 **Phase 2/3 的参考设计**（公网入口 + AF_XDP + SSH punt）。Phase 0/1 只用 lab veth 和纯 HTTP，不需要 `vpp-web`/`vpp-punt` TUN。
+> 本节及第 5、6 节是 **Phase 2/3 的参考设计**（公网入口 + AF_XDP + SSH punt）。Phase 0 用 veth + `af_packet`，Phase 1 用 `tap` 插件的 TUN 接口，都是纯 HTTP，不需要 `vpp-web`/`vpp-punt` TUN。
 
 | 用途 | VPP 侧 | Host/容器侧 | 说明 |
 |---|---|---|---|

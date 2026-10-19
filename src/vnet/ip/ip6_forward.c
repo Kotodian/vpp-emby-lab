@@ -1162,6 +1162,10 @@ ip6_urpf_loose_check (ip6_main_t * im, vlib_buffer_t * b, ip6_header_t * i)
   index_t lbi;
   u32 fib_index;
 
+  /* Locally generated packets cannot spoof a local source address. */
+  if (PREDICT_FALSE (b->flags & VNET_BUFFER_F_LOCALLY_ORIGINATED))
+    return 1;
+
   fib_index = vec_elt (im->fib_index_by_sw_if_index,
 		       vnet_buffer (b)->sw_if_index[VLIB_RX]);
   fib_index =

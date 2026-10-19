@@ -4,6 +4,12 @@
 /build-root/.ccache
 /build-root/build-*/
 /build-root/install-*/
+/build-vpp-afxdp/
+/build-vpp-afxdp-install/
+/build-vpp-release-afxdp/
+/build-vpp-release-afxdp-install/
+/build-vpp-release-afxdp-symbols.tar.xz
+/build-vpp-*/
 /build-root/tools
 /build-root/dpdk-includes/
 /build-root/dpdk_mlx_default.sh
@@ -24,6 +30,8 @@
 /build/external/*.tar.gz
 /build/external/*.tar.xz
 /build/external/vpp-*
+/build/external/_build/
+/build/external/_install/
 /build/external/dpdk_mlx_default.sh
 /build/external/downloads/
 /build/external/deb/_build/

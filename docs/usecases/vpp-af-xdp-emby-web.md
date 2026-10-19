@@ -248,6 +248,33 @@ Phase 1 的边界（与 Phase 2 的唯一区别就在这里）：
 - **Caddy 保持运行**，Docker Emby 保持不动，两个环境互不干扰。
 - 功能代码（nginx 混合路由 + VPP internal media app）在 Phase 2 原样复用，一行不改。
 
+#### 实测结论（2026-10-19，`tap` TUN + nginx VCL）
+
+已验证：
+
+- `create tap id 0 host-if-name vpp-tun tun` 正常，内核侧 `vpp-tun` 是 `POINTOPOINT,NOARP` 的 TUN 设备。
+- 本机经 `vpp-tun` 访问 VPP host stack：`curl http://10.10.0.1:8080/test.txt` 返回 `200`。
+- **nginx 以 VCL external app 运行正常**：`LD_PRELOAD=libvcl_ldpreload.so` 下 `listen 10.10.0.1:80` 返回 `200`，`ss` 里没有 nginx 的内核监听（`:80` 上的监听仍属于 Caddy）。
+- VCL 必须同时配置 `api-socket-name` 和 `app-socket-api`，只配后者会静默超时。
+
+发现一个硬限制：**同一 VPP 实例内，app 不能连到"本机地址"**。
+
+- `nginx -> 10.255.0.1:8080`（internal app）：`show session` 里是 `10.255.0.1:xxxxx -> 10.255.0.1:8080 SYN_SENT`，`ip4-local` 计数 `ip4 spoofed local-address packet dropped`，连接超时。原因是源地址是本机地址，被 anti-spoof 检查丢弃。
+- IPv6 同样不行：`ip6-input` 报 `ip6 source lookup miss`。
+- `nginx -> 127.0.0.1:8096`（真实 Emby，内核 loopback）：VCL 直接 `connection refused`，VPP 并不拥有 `127.0.0.1`。
+- 本版本没有 local transport（`TRANSPORT_PROTOCOL_LOCAL` 不存在），无法让 app 直连本机 listener。
+
+因此"单实例 nginx VCL + internal app"这条路走不通，必须让 nginx 的连接目标对 VPP 是**非本机地址**。两个可选方案：
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| A（推荐） | 两个 VPP 实例：edge 跑 nginx VCL，media 跑 internal app，中间用 veth + `af_packet` 相连；nginx 连 `10.20.0.2:8080` | 多一个 VPP 实例（内存/核） |
+| B | 单实例 + 内核 hairpin：nginx 连 `10.10.0.2:8080`，内核 DNAT + MASQUERADE 回 `10.10.0.1:8080` | 多一次内核转发，配置脏 |
+
+真实 Emby 的 API 也有同样问题：VCL 访问不了 `127.0.0.1`，需要把 Emby 暴露到 tap 内核侧地址（`10.10.0.2:8096`，用 iptables DNAT 到 `127.0.0.1:8096`）。
+
+下面的拓扑是**单实例方案（已证明失败）**，保留作为对照；选定方案后按上表改写。
+
 ```text
 本机 curl（源 10.10.0.2）
    |  vpp-tun（内核 TUN 设备）

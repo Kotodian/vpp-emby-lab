@@ -250,40 +250,30 @@ Phase 1 的边界（与 Phase 2 的唯一区别就在这里）：
 
 #### 实测结论（2026-10-19，`tap` TUN + nginx VCL）
 
-已验证：
+已验证可用的完整链路：
 
-- `create tap id 0 host-if-name vpp-tun tun` 正常，内核侧 `vpp-tun` 是 `POINTOPOINT,NOARP` 的 TUN 设备。
-- 本机经 `vpp-tun` 访问 VPP host stack：`curl http://10.10.0.1:8080/test.txt` 返回 `200`。
-- **nginx 以 VCL external app 运行正常**：`LD_PRELOAD=libvcl_ldpreload.so` 下 `listen 10.10.0.1:80` 返回 `200`，`ss` 里没有 nginx 的内核监听（`:80` 上的监听仍属于 Caddy）。
-- VCL 必须同时配置 `api-socket-name` 和 `app-socket-api`，只配后者会静默超时。
+| 路径 | 结果 |
+|---|---|
+| 本机 -> `vpp-tun` -> VPP internal app（`10.10.0.1:8080`） | 200 |
+| 本机 -> `vpp-tun` -> nginx VCL（`10.10.0.1:80`） | 200 |
+| nginx -> 真实 Emby（`10.10.0.2:8096`，内核 DNAT 到 `127.0.0.1:8096`） | 200 |
+| nginx -> VPP media app（`10.255.0.1:8080`，**全程 VPP，不经内核**） | 200 |
 
-发现一个硬限制：**同一 VPP 实例内，app 不能连到"本机地址"**。
+`create tap id 0 host-if-name vpp-tun tun` 正常，内核侧是 `POINTOPOINT,NOARP` 的 TUN 设备。VCL 必须同时配置 `api-socket-name` 和 `app-socket-api`，只配后者会静默超时。
 
-- `nginx -> 10.255.0.1:8080`（internal app）：`show session` 里是 `10.255.0.1:xxxxx -> 10.255.0.1:8080 SYN_SENT`，`ip4-local` 计数 `ip4 spoofed local-address packet dropped`，连接超时。原因是源地址是本机地址，被 anti-spoof 检查丢弃。
-- IPv6 同样不行：`ip6-input` 报 `ip6 source lookup miss`。
-- `nginx -> 127.0.0.1:8096`（真实 Emby，内核 loopback）：VCL 直接 `connection refused`，VPP 并不拥有 `127.0.0.1`。
-- 本版本没有 local transport（`TRANSPORT_PROTOCOL_LOCAL` 不存在），无法让 app 直连本机 listener。
+上游 VPP 默认会丢弃"本机地址 -> 本机地址"的连接：`ip4-local` 的反欺骗检查（IPv6 是 uRPF）把源地址是本机地址的包当成 spoof 丢掉。表现是 `show session` 里 `10.255.0.1:xxxxx -> 10.255.0.1:8080 SYN_SENT`，`ip4 spoofed local-address packet dropped` 递增。
 
-因此"单实例 nginx VCL + internal app"这条路走不通，必须让 nginx 的连接目标对 VPP 是**非本机地址**。两个可选方案：
+修复方式见下面的源码补丁：本机协议栈生成的包已经带 `VNET_BUFFER_F_LOCALLY_ORIGINATED`（`tcp_output.c` 设置），让反欺骗检查对它放行即可。修完后 `nginx -> 10.255.0.1:8080` 返回 200，媒体路径**全程在 VPP host stack 内**，不经过内核。
 
-| 方案 | 做法 | 代价 |
-|---|---|---|
-| A（推荐） | 两个 VPP 实例：edge 跑 nginx VCL，media 跑 internal app，中间用 veth + `af_packet` 相连；nginx 连 `10.20.0.2:8080` | 多一个 VPP 实例（内存/核） |
-| B | 单实例 + 内核 hairpin：nginx 连 `10.10.0.2:8080`，内核 DNAT + MASQUERADE 回 `10.10.0.1:8080` | 多一次内核转发，配置脏 |
-
-真实 Emby 的 API 也有同样问题：VCL 访问不了 `127.0.0.1`，需要把 Emby 暴露到 tap 内核侧地址（`10.10.0.2:8096`，用 iptables DNAT 到 `127.0.0.1:8096`）。
-
-下面的拓扑是**单实例方案（已证明失败）**，保留作为对照；选定方案后按上表改写。
+真实 Emby 是内核里的 Docker 进程，API 那一段必须出 VPP：nginx 连 `10.10.0.2:8096`，内核 DNAT 到 `127.0.0.1:8096`。这是唯一需要内核的地方，且只承载 API/元数据，不承载视频流。
 
 ```text
 本机 curl（源 10.10.0.2）
-   |  vpp-tun（内核 TUN 设备）
+   |  vpp-tun（tap 插件 TUN）
    v
-tap0 (VPP, TUN 模式, 10.10.0.1/24)
-   |
-nginx (external VCL, 纯 HTTP, 10.10.0.1:80)
-   |-- API  --> 127.0.0.1:8096   (真实 Emby，内核 loopback)
-   `-- 播放 --> 10.255.0.1:8080  (VPP internal media app)
+VPP: 10.10.0.1:80  nginx (VCL)
+   |-- API  --> 10.10.0.2:8096 --[内核 DNAT]--> 127.0.0.1:8096 (真实 Emby)
+   `-- 播放 --> 10.255.0.1:8080 -------------> VPP internal app（纯 VPP）
 ```
 
 为什么 Phase 1 也要 nginx：Emby 客户端必须先登录、拿到 `PlaybackInfo` 才能点到播放 URL。没有 nginx 做混合路由，客户端连 API 都到不了真实 Emby。所以 Phase 1 和 Phase 2 的差别只在**入口**（TUN/HTTP vs WAN/HTTPS），不在路由和播放实现。
@@ -292,12 +282,12 @@ nginx (external VCL, 纯 HTTP, 10.10.0.1:80)
 
 | 路径 | 目标 | 说明 |
 |---|---|---|
-| `/System/*`、`/Users/*`、`/Items/*`（非播放） | `127.0.0.1:8096` | 真实 Emby API |
-| `/emby/System/*`、`/emby/Users/*`、`/emby/Items/*`（非播放） | `127.0.0.1:8096` | Emby base path API |
-| `/(emby/)?Videos/*/stream`、`/(emby/)?Videos/*/original` | `10.255.0.1:8080` | VPP 播放 |
-| `/(emby/)?Items/*/Download`、`/(emby/)?Audio/*/stream` | `10.255.0.1:8080` | VPP 播放 |
-| `/hls/*`、`/(emby/)?Videos/*/master.m3u8` | `10.255.0.1:8080` | VPP HLS |
-| 其他 | `127.0.0.1:8096` | 默认回 API |
+| `/System/*`、`/Users/*`、`/Items/*`（非播放） | `10.10.0.2:8096` | 真实 Emby API（内核 DNAT） |
+| `/emby/System/*`、`/emby/Users/*`、`/emby/Items/*`（非播放） | `10.10.0.2:8096` | Emby base path API（内核 DNAT） |
+| `/(emby/)?Videos/*/stream`、`/(emby/)?Videos/*/original` | `10.255.0.1:8080` | VPP 播放（纯 VPP） |
+| `/(emby/)?Items/*/Download`、`/(emby/)?Audio/*/stream` | `10.255.0.1:8080` | VPP 播放（纯 VPP） |
+| `/hls/*`、`/(emby/)?Videos/*/master.m3u8` | `10.255.0.1:8080` | VPP HLS（纯 VPP） |
+| 其他 | `10.10.0.2:8096` | 默认回 API |
 
 **关键点**：播放 URL 必须命中 VPP，而不是被 nginx 默认反代到 Emby。Emby 的 `PlaybackInfo` 返回 `DirectStreamUrl` 时通常就是 `/Videos/{id}/stream`，nginx 按上面的规则切到 VPP；如果 Emby 返回的是转码 URL，MVP 不处理，先用 direct-play 兼容的媒体测试。
 
@@ -306,7 +296,7 @@ nginx (external VCL, 纯 HTTP, 10.10.0.1:80)
 nginx VCL 关键配置：
 
 ```nginx
-upstream emby_api  { server 127.0.0.1:8096; keepalive 32; }
+upstream emby_api  { server 10.10.0.2:8096; keepalive 32; }
 upstream vpp_media { server 10.255.0.1:8080; keepalive 64; }
 
 server {
@@ -355,6 +345,48 @@ vcl {
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libvcl_ldpreload.so \
 VCL_CONFIG=/etc/vpp/vcl.conf \
 nginx -g 'daemon off;'
+```
+
+#### 源码补丁：允许本机 app 互连
+
+VPP 原本会丢弃"本机地址 -> 本机地址"的 TCP 连接。本机协议栈生成的包已经带 `VNET_BUFFER_F_LOCALLY_ORIGINATED`（`src/vnet/tcp/tcp_output.c` 设置），只是反欺骗/uRPF 检查没看这个标记。补三处：
+
+```c
+/* src/vnet/ip/ip4_forward.c - ip4_local_check_src() */
+if (PREDICT_FALSE (b->flags & VNET_BUFFER_F_LOCALLY_ORIGINATED))
+  {
+    vnet_buffer (b)->ip.adj_index[VLIB_RX] =
+      vnet_buffer (b)->ip.adj_index[VLIB_TX];
+    return;
+  }
+
+/* src/vnet/ip/ip4_forward.c - ip4_local_check_src_x2() */
+if (PREDICT_FALSE ((b[0]->flags | b[1]->flags) &
+                   VNET_BUFFER_F_LOCALLY_ORIGINATED))
+  {
+    ip4_local_check_src (b[0], ip[0], last_check, &error[0], is_receive_dpo);
+    ip4_local_check_src (b[1], ip[1], last_check, &error[1], is_receive_dpo);
+    return;
+  }
+
+/* src/vnet/ip/ip6_forward.c - ip6_urpf_loose_check() */
+if (PREDICT_FALSE (b->flags & VNET_BUFFER_F_LOCALLY_ORIGINATED))
+  return 1;
+```
+
+语义：反欺骗/uRPF 检查针对的是**从接口收到的包**，本机协议栈自己生成的包不可能伪造本机源地址，放行是安全的。现有代码已经在 TTL/跳数处理里用同一个标记区分本机包（`ip4_ttl_inc`、`ip6_rewrite`）。
+
+实测：打补丁后 `nginx(VCL) -> 10.255.0.1:8080` 返回 200，`show errors` 无 spoof 计数，媒体路径全程在 VPP 内。
+
+#### nginx 上游
+
+- 播放：`10.255.0.1:8080`（VPP loop0，**纯 VPP**）
+- API：`10.10.0.2:8096`，内核 DNAT 到 `127.0.0.1:8096`。真实 Emby 是内核里的 Docker 进程，这一段无法避免出 VPP，但它只承载 API/元数据，不承载视频流。
+
+```bash
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv4.conf.vpp-tun.route_localnet=1
+iptables -t nat -A PREROUTING -i vpp-tun -p tcp -d 10.10.0.2 --dport 8096 -j DNAT --to-destination 127.0.0.1:8096
 ```
 
 #### 3.1.1 播放后端：VPP internal media app
@@ -485,10 +517,10 @@ create tap id 0 if-name tap0 host-if-name vpp-tun tun host-mtu-size 1500
 set interface state tap0 up
 set interface ip address tap0 10.10.0.1/24
 
-# nginx 与 internal media app 之间的内部地址，纯 VPP，不经内核
+# loop0：internal media app 的内部地址，纯 VPP
 create loopback interface instance 0
-set interface state loopback0 up
-set interface ip address loopback0 10.255.0.1/32
+set interface state loop0 up
+set interface ip address loop0 10.255.0.1/32
 ```
 
 内核侧（`vpp-tun` 由 VPP 创建，不要手工 `ip tuntap add`）：
@@ -504,8 +536,8 @@ ip route get 10.10.0.1        # 应显示 dev vpp-tun
 | 地址 | 谁在用 | 用途 |
 |---|---|---|
 | `10.10.0.1:80` | nginx（监听） | 本机测试入口，经 `vpp-tun` 进来 |
-| `10.10.0.2` | 内核 `vpp-tun` | 本机测试源地址 |
-| `10.255.0.1:8080` | internal media app（绑 `0.0.0.0:8080`） | nginx 的播放 upstream，纯 VPP 内部 |
+| `10.10.0.2` | 内核 `vpp-tun` | API upstream 的目标地址（DNAT 到 127.0.0.1:8096） |
+| `10.255.0.1:8080` | internal media app（绑 `0.0.0.0:8080`） | nginx 的播放 upstream，纯 VPP |
 
 #### 启用 internal HTTP app
 
@@ -661,13 +693,31 @@ ip route add 0.0.0.0/0 via 184.107.84.254 host-enp2s0f0
 # ip neighbor add 184.107.84.254 <gateway-mac> host-enp2s0f0
 ```
 
-4. 给 nginx 和 internal app 一个 VPP 内部地址：
+4. 内部 app 地址（纯 VPP）+ 一条只给 API 用的内核 TUN：
 
 ```text
+# 播放：nginx -> internal app，纯 VPP
 create loopback interface instance 0
-set interface state loopback0 up
-set interface ip address loopback0 10.255.0.1/32
+set interface state loop0 up
+set interface ip address loop0 10.255.0.1/32
+
+# API：真实 Emby 在内核里，必须留一条出口 TUN
+create tap id 1 if-name svc0 host-if-name vpp-svc tun host-mtu-size 1500
+set interface state svc0 up
+set interface ip address svc0 10.40.0.1/24
 ```
+
+内核侧：
+
+```bash
+ip link set vpp-svc up
+ip addr add 10.40.0.2/24 dev vpp-svc
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv4.conf.vpp-svc.route_localnet=1
+iptables -t nat -A PREROUTING -i vpp-svc -p tcp -d 10.40.0.2 --dport 8096 -j DNAT --to-destination 127.0.0.1:8096
+```
+
+nginx 的 `emby_api` upstream 用 `10.40.0.2:8096`；`vpp_media` 仍用 `10.255.0.1:8080`。
 
 5. internal media app 的监听地址与 Phase 1 完全相同（`tcp://0.0.0.0/8080`），不需要改：
 
@@ -717,10 +767,10 @@ systemctl start caddy
 
 nginx VCL 配置骨架：
 
-> 与 3.1 的 Phase 1 配置相比，**只有 `listen` / `server_name` / 证书三处不同**，路由表原样保留。
+> 与 3.1 的 Phase 1 配置相比，**只有 `listen` / `server_name` / 证书三处不同**，路由表和播放上游原样保留；`emby_api` 改成 Phase 2 出口 TUN 的 `10.40.0.2:8096`。
 
 ```nginx
-upstream emby_api  { server 127.0.0.1:8096; keepalive 32; }
+upstream emby_api  { server 10.40.0.2:8096; keepalive 32; }
 upstream vpp_media { server 10.255.0.1:8080; keepalive 64; }
 
 server {

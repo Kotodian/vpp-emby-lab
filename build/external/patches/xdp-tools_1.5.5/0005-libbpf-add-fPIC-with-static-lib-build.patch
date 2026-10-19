@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: VPP Build <vpp-dev@lists.fd.io>
+Date: Mon, 19 Oct 2026 00:00:00 +0000
+Subject: [PATCH] libbpf: add fPIC with static lib build
+
+The xdp-tools install recipe may build the bundled libbpf.a directly,
+without going through lib/Makefile which passes -fPIC. Without -fPIC the
+archive cannot be linked into the af_xdp VPP plugin, which is a shared
+object, on toolchains that reject text relocations.
+---
+ lib/libbpf/src/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/libbpf/src/Makefile b/lib/libbpf/src/Makefile
+--- a/lib/libbpf/src/Makefile
++++ b/lib/libbpf/src/Makefile
+@@ -132,6 +132,6 @@ $(STATIC_OBJDIR)/%.o: %.c | $(STATIC_OBJDIR)
+ $(STATIC_OBJDIR)/%.o: %.c | $(STATIC_OBJDIR)
+ 	$(call msg,CC,$@)
+-	$(Q)$(CC) $(ALL_CFLAGS) $(CPPFLAGS) -c $< -o $@
++	$(Q)$(CC) $(ALL_CFLAGS) $(CPPFLAGS) -fPIC -c $< -o $@
+ 
+ $(SHARED_OBJDIR)/%.o: %.c | $(SHARED_OBJDIR)
+ 	$(call msg,CC,$@)
+-- 
+2.25.1

@@ -16,6 +16,13 @@ include ../packages_common.mk
 
 PKG_SUFFIX ?= $(shell git log --oneline v$(PKG_VERSION)-rc0.. . | wc -l)
 
+# DPDK is skipped by default in this checkout. Set to "yes" to build and
+# install DPDK from the external dependency tree. Without DPDK headers the
+# VPP dpdk plugin is disabled automatically.
+VPP_EXTERNAL_DPDK ?= no
+VPP_EXTERNAL_DPDK_INSTALL = $(if $(filter yes,$(VPP_EXTERNAL_DPDK)),dpdk-install)
+VPP_EXTERNAL_DPDK_CONFIG = $(if $(filter yes,$(VPP_EXTERNAL_DPDK)),dpdk-config)
+
 include packages/daq.mk
 include packages/ipsec-mb.mk
 include packages/quicly.mk
@@ -33,16 +40,16 @@ clean:
 
 .PHONY: install
 ifeq ($(shell uname), FreeBSD)
-install: $(if $(ARCH_X86_64), ipsec-mb-install) daq-install dpdk-install quicly-install libcbor-install
+install: $(if $(ARCH_X86_64), ipsec-mb-install) daq-install $(VPP_EXTERNAL_DPDK_INSTALL) quicly-install libcbor-install
 else
-install: $(if $(ARCH_X86_64), ipsec-mb-install) daq-install dpdk-install rdma-core-install quicly-install xdp-tools-install libcbor-install $(if $(AARCH64), octeon-roc-install)
+install: $(if $(ARCH_X86_64), ipsec-mb-install) daq-install $(VPP_EXTERNAL_DPDK_INSTALL) rdma-core-install quicly-install xdp-tools-install libcbor-install $(if $(AARCH64), octeon-roc-install)
 endif	# FreeBSD
 
 .PHONY: config
 ifeq ($(shell uname), FreeBSD)
-config: daq-config $(if $(ARCH_X86_64), ipsec-mb-config) dpdk-config quicly-build libcbor-build
+config: daq-config $(if $(ARCH_X86_64), ipsec-mb-config) $(VPP_EXTERNAL_DPDK_CONFIG) quicly-build libcbor-build
 else
-config: daq-config $(if $(ARCH_X86_64), ipsec-mb-config) dpdk-config rdma-core-config quicly-build libcbor-build
+config: daq-config $(if $(ARCH_X86_64), ipsec-mb-config) $(VPP_EXTERNAL_DPDK_CONFIG) rdma-core-config quicly-build libcbor-build
 endif	# FreeBSD
 
 ##############################################################################

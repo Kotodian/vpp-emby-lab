@@ -5,7 +5,7 @@
 ## 0. 结论摘要
 
 - 当前 WAN 是 `enp2s0f0`，公网地址 `184.107.84.201/26`，网关 `184.107.84.254`，Intel I350（`igb`）1GbE。
-- `xdp-loader features enp2s0f0` 显示 `NETDEV_XDP_ACT_XSK_ZEROCOPY=no`，因此 AF_XDP 只能使用 **copy 模式**（`no-zero-copy`），不能使用零拷贝。
+- **当前内核 6.8**：`xdp-loader features enp2s0f0` 显示 `NETDEV_XDP_ACT_XSK_ZEROCOPY=no`，只能 copy 模式（`no-zero-copy`）。这是**内核版本限制，不是 I350 硬件的限制**：igb 的 AF_XDP zero-copy 补丁系列已在 **Linux 6.14** 合入（LWN 986006 就是这组 patch 的 v6）。升级到 ≥6.14 后同一张网卡可以开 zero-copy。
 - 旧环境 80/443 由 **Caddy 2.11.4** 监听；新方案不迁移旧环境。新环境里的 nginx 是**另起的一套**（跑在 VPP host stack 上），与 Caddy 并存时用不同入口（lab 地址/端口），Phase 2 测试时才临时停 Caddy。
 - Emby 保持现状：Docker 容器 `av-emby`（4.9.5.0），配置 `/root/emby/docker_app/amilys_embyserver/config`，媒体 `/root/emby/media`。新环境只把它当 **API 上游**（`127.0.0.1:8096`），不迁移、不换 systemd。
 - 其他 Docker 服务（openlist、metatube、Prowlarr、Whisparr、av-subscriber）不在本次 Emby 迁移范围内；如果目标是彻底移除 Docker，需要单独逐项迁移。
@@ -15,7 +15,7 @@
 - 推荐顺序：Phase 0 隔离 lab + 裸 HTTP 验证 -> Phase 1 本机 TUN 验证混合路由（nginx VCL + VPP internal app，纯 HTTP）-> Phase 2 同一套接到公网（TLS + `pornvpp.linqiankai.top` + 停 Caddy）-> Phase 3 AF_XDP + 强制 SSH punt。
 - `pornvpp.linqiankai.top` 的 A 记录已生效（`184.107.84.201`），Let's Encrypt HTTP-01 证书已签发：
   `/etc/letsencrypt/live/pornvpp.linqiankai.top/{fullchain.pem,privkey.pem}`，ECDSA，有效期到 2027-01-17；Caddy 已恢复。
-- Phase 0/1 的 lab 构建实测插件集：`af_packet,tap,http,http_static`（`./configure -P af_packet,tap,http,http_static -D none -S none -E none`），已包含 `vppctl` 和 VCL 库（`libvcl_ldpreload.so`）。Phase 2 切 `af_xdp`（I350 只能 `no-zero-copy`），并补 `linux_cp/linux_nl/nat/ip_session_redirect`。
+- Phase 0/1 的 lab 构建实测插件集：`af_packet,tap,http,http_static`（`./configure -P af_packet,tap,http,http_static -D none -S none -E none`），已包含 `vppctl` 和 VCL 库（`libvcl_ldpreload.so`）。Phase 2 切 `af_xdp`（内核 ≥6.14 可 zero-copy，6.8 用 `no-zero-copy`），并补 `linux_cp/linux_nl/nat/ip_session_redirect`。
 
 ## 1. 现状盘点
 
@@ -54,7 +54,7 @@ NETDEV_XDP_ACT_XSK_ZEROCOPY: no
 NETDEV_XDP_ACT_NDO_XMIT:    no
 ```
 
-结论：可以使用 AF_XDP，但必须 `no-zero-copy`。I350 是 1GbE，实际吞吐上限约 1Gbps，且 copy 模式会额外占用 CPU。
+结论：当前 6.8 内核上必须 `no-zero-copy`；Linux ≥6.14 的 igb 已支持 zero-copy，升级内核后可以完全去掉这次拷贝。判断依据始终以 `xdp-loader features` 为准。
 
 ### 1.3 地址与路由
 
@@ -178,7 +178,7 @@ control sock /root/.codex/app-server-control/app-server-control.sock
 
 约束：
 
-- I350 不支持 AF_XDP zero-copy，只能 copy 模式。
+- AF_XDP zero-copy 取决于内核：当前 6.8 不支持（只能 copy）；Linux ≥6.14 的 igb 已合入支持，升级后可开。
 - 单公网 IP `184.107.84.201` 同时承载 80/443、SSH、BT 等，需要按端口分流。
 - 现有 Caddy/Docker Emby 是旧环境，本方案不修改；新环境独立部署、独立 CLI socket、独立测试接口。
 - app-server 当前是 Unix socket；推荐只改成 localhost `ws://` 并走 SSH 隧道，不建议把它的 `ws://` 直接暴露到 WAN。
@@ -686,7 +686,7 @@ Phase 2 **不改任何功能代码**，只把 Phase 1 的入口从 lab 换成公
 |---|---|---|
 | 监听 | `10.10.0.1:80`，纯 HTTP | `184.107.84.201:443`，TLS |
 | 域名 | 无，本机直连 `10.10.0.1` | `pornvpp.linqiankai.top` |
-| WAN 网卡 | 内核持有，不动 | VPP `af_xdp`（copy 模式）接管 `enp2s0f0`，内核地址 flush |
+| WAN 网卡 | 内核持有，不动 | VPP `af_xdp` 接管 `enp2s0f0`（≥6.14 用 zero-copy，6.8 用 copy），内核地址 flush |
 | Caddy | 保持运行，互不干扰 | 临时停止（同一 IP:443 冲突） |
 | nginx 配置 | 见 3.1 | 只改 `listen` / `server_name` / 证书三处 |
 | 路由表、internal app | 3.1 的实现 | **完全相同** |
@@ -733,10 +733,12 @@ ip addr flush dev enp2s0f0
 ip link set enp2s0f0 up
 ```
 
-3. 用 AF_XDP 接管 `enp2s0f0`（I350 不支持 zero-copy，用 copy 模式）：
+3. 用 AF_XDP 接管 `enp2s0f0`（内核 ≥6.14 用 `zero-copy`；6.8 用 `no-zero-copy`）：
 
 ```text
-create interface af_xdp host-if enp2s0f0 name wan0 no-zero-copy
+create interface af_xdp host-if enp2s0f0 name wan0 zero-copy
+# 内核 < 6.14 改成：
+# create interface af_xdp host-if enp2s0f0 name wan0 no-zero-copy
 set interface state wan0 up
 set interface ip address wan0 184.107.84.201/26
 ip route add 0.0.0.0/0 via 184.107.84.254 wan0
@@ -744,7 +746,7 @@ ip route add 0.0.0.0/0 via 184.107.84.254 wan0
 # ip neighbor add 184.107.84.254 <gateway-mac> wan0
 ```
 
-为什么 Phase 2 不用 `af_packet`：af_packet 每个包都要经过内核网络栈并多一次拷贝，CPU 和延迟都明显高于 AF_XDP。I350 虽然没有 zero-copy，但 AF_XDP copy 模式仍然绕过内核网络栈；1GbE 场景跑满线速没问题，CPU 占用也低得多。`af_packet` 只用在 Phase 0 的隔离 lab。
+为什么 Phase 2 不用 `af_packet`：af_packet 每个包都要经过内核网络栈并多一次拷贝，CPU 和延迟都明显高于 AF_XDP。AF_XDP 即使在 copy 模式下也绕过内核网络栈；内核 ≥6.14 还能直接 zero-copy。`af_packet` 只用在 Phase 0 的隔离 lab。
 
 **SSH punt 必须在 Phase 2 同步完成**：AF_XDP 接管网卡后内核收不到 WAN 包，SSH 会直接断。按第 6 节创建 `vpp-punt` TAP、`set punt tcp all` 和 `ip punt redirect`，并先验证 SSH 可登录再继续。
 
@@ -818,7 +820,7 @@ ip route add default via 184.107.84.254 dev enp2s0f0 onlink
 systemctl start caddy
 ```
 
-注意：Phase 2 直接用 AF_XDP copy 模式，`af_packet` 只用于 Phase 0 lab。SSH punt 不是 Phase 3 的事，必须在 Phase 2 一起做完并验证。
+注意：Phase 2 直接用 AF_XDP（≥6.14 优先 zero-copy，6.8 回退 copy），`af_packet` 只用于 Phase 0 lab。SSH punt 不是 Phase 3 的事，必须在 Phase 2 一起做完并验证。
 
 nginx VCL 配置骨架：
 
@@ -864,9 +866,9 @@ nginx -g 'daemon off;'
 
 ### 3.3 Phase 3：性能与加固（可选）
 
-Phase 2 已经用 AF_XDP copy 模式接管 WAN，SSH punt 也已启用。Phase 3 只做可选优化：
+Phase 2 已经用 AF_XDP（zero-copy 或 copy）接管 WAN，SSH punt 也已启用。Phase 3 只做可选优化：
 
-- 压测 `af_xdp` copy 模式的 pps/CPU，按需增加 worker、调整 RX 队列和 `buffers-per-numa`。
+- 压测 `af_xdp` 的 pps/CPU（先确认 `xdp-loader features` 是否给出 zero-copy），按需增加 worker、调整 RX 队列和 `buffers-per-numa`。
 - 评估 DPDK：唯一能去掉拷贝的方案，但会独占网卡；单网卡机器上 SSH/管理流量必须全部走 punt，风险高。1GbE 场景不建议。
 - 评估 linux-cp：让内核接管 ARP/ND，减少手工邻居配置；SSH 的 TCP punt 规则仍然必须显式配置和验证。
 - SSH punt 回归测试（Phase 2 已启用，Phase 3 只验证和加固）。
@@ -965,7 +967,7 @@ plugins {
 
 ```text
 # WAN
-create interface af_xdp host-if enp2s0f0 name wan0 num-rx-queues 4 no-zero-copy mac-reuse
+create interface af_xdp host-if enp2s0f0 name wan0 num-rx-queues 4 zero-copy mac-reuse
 set interface state wan0 up
 set interface ip address wan0 184.107.84.201/26
 ip route add 0.0.0.0/0 via 184.107.84.254 wan0
@@ -1668,7 +1670,7 @@ ss -ltnp | grep ':8080'        # 服务端不应出现内核监听
 
 ## 12. 风险与待确认
 
-1. **AF_XDP copy 模式**：I350 不支持 zero-copy，1Gbps 上限，CPU 拷贝成本需要实测。
+1. **AF_XDP**：内核 ≥6.14 可 zero-copy；6.8 只能 copy，CPU 拷贝成本需要实测。1Gbps 是网卡上限。
 2. **Emby 路径**：Emby 已改为 systemd，但仍经过 host 内核；性能不是目标时不需要 Phase 2 直连 TAP。
 3. **旧环境不参与**：Caddy/Docker Emby 不迁移、不改动；新方案只在新环境做 internal HTTP app。
 4. **SSH punt 范围**：`set punt tcp all` 会把所有未知 TCP 送到内核，必须用 nftables/ACL 限流；严格只匹配 22 需要 `ip_session_redirect`（实验性）。

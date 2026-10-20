@@ -766,7 +766,13 @@ ip route add 0.0.0.0/0 via 184.107.84.254 wan0
 - 去掉 `XDP_USE_NEED_WAKEUP` 后仍是 0；
 - 同一张网卡上 `af_packet` 正常收包（3 秒 331 包）。
 
-结论：内核侧支持已经就绪，问题在 **VPP af_xdp 插件与 igb/内核 7.0 的 XSK 交互**（UMEM/fill ring/unaligned chunks 方向），需要独立 XSK 工具进一步定位。当前 Phase 2 继续用 `af_packet`。
+已用独立 XSK 测试程序进一步定位：
+
+- 独立程序绑定 8 个队列，用 `XDP_COPY` + `xsk_def_xdp_prog.o`，在 queue 0 上收到了 3 个包。**内核和 igb 的 AF_XDP 本身是正常的**，队列覆盖也不是问题（8 个队列全绑，流量确实落在 queue 0 的 XSK 上）。
+- 差异在 UMEM：独立程序用 **frame-aligned** 的独立 mmap 区；VPP 插件把 **VPP buffer pool** 直接注册成 UMEM，并设置 `XDP_UMEM_UNALIGNED_CHUNK_FLAG`。igb 的 XSK 路径不接受这种非对齐 chunk，所以 `xsk_ring_cons__peek` 永远为 0。
+- 去掉 `XDP_UMEM_UNALIGNED_CHUNK_FLAG` 后，`xsk_umem__create()` 因为 VPP buffer 地址不是 frame-aligned 而失败，插件在错误路径上还会触发 `vnet_delete_hw_interface` 的空指针崩溃。
+
+结论：**VPP 的 af_xdp 插件需要改成独立的 frame-aligned UMEM（在 UMEM 和 VPP buffer 之间做一次 copy），或者改用 DPDK**；当前内核无需再升级。Phase 2 先用 `af_packet`。
 
 **为什么当前 6.8 不能用 AF_XDP**：Linux 6.13 及以前的 igb 驱动**完全没有 AF_XDP 代码**（没有 `xsk`、没有 `ndo_xsk_wakeup`），6.14 才加入（含 zero-copy）。6.8 上 XDP 程序能挂成 native，但 XSK redirect 不工作：VPP rx=0，内核也收不到包，WAN 直接断。已实测排除队列数（8/1 队列）和 memlock（4GB）因素。
 

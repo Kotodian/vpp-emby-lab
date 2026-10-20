@@ -5,17 +5,17 @@
 ## 0. 结论摘要
 
 - 当前 WAN 是 `enp2s0f0`，公网地址 `184.107.84.201/26`，网关 `184.107.84.254`，Intel I350（`igb`）1GbE。
-- **当前内核 6.8**：`xdp-loader features enp2s0f0` 显示 `NETDEV_XDP_ACT_XSK_ZEROCOPY=no`，只能 copy 模式（`no-zero-copy`）。这是**内核版本限制，不是 I350 硬件的限制**：igb 的 AF_XDP zero-copy 补丁系列已在 **Linux 6.14** 合入（LWN 986006 就是这组 patch 的 v6）。升级到 ≥6.14 后同一张网卡可以开 zero-copy。
+- **当前内核 6.8**：`xdp-loader features enp2s0f0` 显示 `NETDEV_XDP_ACT_XSK_ZEROCOPY=no`，只能 copy 模式（`no-zero-copy`）。这是**内核版本限制，不是 I350 硬件的限制**：igb 在 6.14 之前**完全没有 AF_XDP 支持**（不只是 zero-copy），6.13 的 igb 源码里没有任何 `xsk` 引用；6.14 才加入（LWN 986006 就是这组 patch 的 v6）。升级到 ≥6.14 后同一张网卡可以开 zero-copy。
 - 旧环境 80/443 由 **Caddy 2.11.4** 监听；新方案不迁移旧环境。新环境里的 nginx 是**另起的一套**（跑在 VPP host stack 上），与 Caddy 并存时用不同入口（lab 地址/端口），Phase 2 测试时才临时停 Caddy。
 - Emby 保持现状：Docker 容器 `av-emby`（4.9.5.0），配置 `/root/emby/docker_app/amilys_embyserver/config`，媒体 `/root/emby/media`。新环境只把它当 **API 上游**（`127.0.0.1:8096`），不迁移、不换 systemd。
 - 其他 Docker 服务（openlist、metatube、Prowlarr、Whisparr、av-subscriber）不在本次 Emby 迁移范围内；如果目标是彻底移除 Docker，需要单独逐项迁移。
 - Codex app-server 当前使用 `--listen unix://`，只有 Unix socket。推荐让它只监听 `ws://127.0.0.1:8790`，本地通过 SSH 本地端口转发访问；这样 app-server 不需要单独做公网 punt，SSH 隧道本身就走在 punt 路径上。
 - `vpp-web` TUN 只属于“保留内核 TCP”的路线。Phase 1/2 都是 **external app（nginx VCL）+ internal app（VPP media plugin）**：客户端到 nginx、nginx 到 internal app 都走 VPP host stack，不需要 `vpp-web` TUN。只有 nginx -> 真实 Emby 的 `127.0.0.1:8096` 那一段仍是内核 loopback。
-- **当前优先 Phase 0：隔离 lab + 裸 HTTP internal app。** 独立 VPP 实例 + veth + `af_packet`，不碰现有 Caddy/Docker/Emby/`enp2s0f0`。Phase 2 直接上 **AF_XDP copy 模式**，SSH punt 同步完成；`af_packet` 只保留给 Phase 0 lab 和排障对照。
+- **当前优先 Phase 0：隔离 lab + 裸 HTTP internal app。** 独立 VPP 实例 + veth + `af_packet`，不碰现有 Caddy/Docker/Emby/`enp2s0f0`。Phase 2 在当前 6.8 内核上用 **af_packet** 跑功能（内核不受影响）；升级到 ≥6.14 后再切 AF_XDP（zero-copy）。
 - 推荐顺序：Phase 0 隔离 lab + 裸 HTTP 验证 -> Phase 1 本机 TUN 验证混合路由（nginx VCL + VPP internal app，纯 HTTP）-> Phase 2 同一套接到公网（TLS + `pornvpp.linqiankai.top` + 停 Caddy）-> Phase 3 AF_XDP + 强制 SSH punt。
 - `pornvpp.linqiankai.top` 的 A 记录已生效（`184.107.84.201`），Let's Encrypt HTTP-01 证书已签发：
   `/etc/letsencrypt/live/pornvpp.linqiankai.top/{fullchain.pem,privkey.pem}`，ECDSA，有效期到 2027-01-17；Caddy 已恢复。
-- Phase 0/1 的 lab 构建实测插件集：`af_packet,tap,http,http_static`（`./configure -P af_packet,tap,http,http_static -D none -S none -E none`），已包含 `vppctl` 和 VCL 库（`libvcl_ldpreload.so`）。Phase 2 切 `af_xdp`（内核 ≥6.14 可 zero-copy，6.8 用 `no-zero-copy`），并补 `linux_cp/linux_nl/nat/ip_session_redirect`。
+- Phase 0/1 的 lab 构建实测插件集：`af_packet,tap,http,http_static`（`./configure -P af_packet,tap,http,http_static -D none -S none -E none`），已包含 `vppctl` 和 VCL 库（`libvcl_ldpreload.so`）。Phase 2 当前用 `af_packet`；内核 ≥6.14 后可切 `af_xdp`（含 zero-copy）。linux-cp/nat/ip_session_redirect 已编进 lab 构建。
 
 ## 1. 现状盘点
 
@@ -686,7 +686,7 @@ Phase 2 **不改任何功能代码**，只把 Phase 1 的入口从 lab 换成公
 |---|---|---|
 | 监听 | `10.10.0.1:80`，纯 HTTP | `184.107.84.201:443`，TLS |
 | 域名 | 无，本机直连 `10.10.0.1` | `pornvpp.linqiankai.top` |
-| WAN 网卡 | 内核持有，不动 | VPP `af_xdp` 接管 `enp2s0f0`（≥6.14 用 zero-copy，6.8 用 copy），内核地址 flush |
+| WAN 网卡 | 内核持有，不动 | 6.8 用 `af_packet` 旁路；≥6.14 用 `af_xdp` 接管 `enp2s0f0` |
 | Caddy | 保持运行，互不干扰 | 临时停止（同一 IP:443 冲突） |
 | nginx 配置 | 见 3.1 | 只改 `listen` / `server_name` / 证书三处 |
 | 路由表、internal app | 3.1 的实现 | **完全相同** |
@@ -733,22 +733,36 @@ ip addr flush dev enp2s0f0
 ip link set enp2s0f0 up
 ```
 
-3. 用 AF_XDP 接管 `enp2s0f0`（内核 ≥6.14 用 `zero-copy`；6.8 用 `no-zero-copy`）：
+3. 数据面接管 `enp2s0f0`：
+
+**当前内核 6.8：用 af_packet**（功能可用，内核仍能收包，SSH 不会断）：
 
 ```text
-create interface af_xdp host-if enp2s0f0 name wan0 zero-copy
-# 内核 < 6.14 改成：
-# create interface af_xdp host-if enp2s0f0 name wan0 no-zero-copy
+create host-interface name enp2s0f0
+set interface state host-enp2s0f0 up
+set interface ip address host-enp2s0f0 184.107.84.201/26
+ip route add 0.0.0.0/0 via 184.107.84.254 host-enp2s0f0
+```
+
+**内核 ≥6.14：用 af_xdp**：
+
+```text
+create interface af_xdp host-if enp2s0f0 name wan0 zero-copy mac-reuse num-rx-queues all
 set interface state wan0 up
 set interface ip address wan0 184.107.84.201/26
 ip route add 0.0.0.0/0 via 184.107.84.254 wan0
-# ARP 不解析时，用第 2 步的 MAC 加静态邻居：
-# ip neighbor add 184.107.84.254 <gateway-mac> wan0
 ```
 
-为什么 Phase 2 不用 `af_packet`：af_packet 每个包都要经过内核网络栈并多一次拷贝，CPU 和延迟都明显高于 AF_XDP。AF_XDP 即使在 copy 模式下也绕过内核网络栈；内核 ≥6.14 还能直接 zero-copy。`af_packet` 只用在 Phase 0 的隔离 lab。
+两个必须注意的点：
 
-**SSH punt 必须在 Phase 2 同步完成**：AF_XDP 接管网卡后内核收不到 WAN 包，SSH 会直接断。按第 6 节创建 `vpp-punt` TAP、`set punt tcp all` 和 `ip punt redirect`，并先验证 SSH 可登录再继续。
+- `num-rx-queues` 必须显式写 `all`（或具体数字）。不写时默认是 0，VPP 会创建 0 个 RX 队列，`show interface` 里 rx 永远为 0。
+- 接口 MTU 必须是 1500。igb 的 XDP 不支持 jumbo，MTU 9000 时 attach 会报 `RX buffer size is too small`，并且触发 af_xdp 失败路径的空指针崩溃。
+
+**为什么当前 6.8 不能用 AF_XDP**：Linux 6.13 及以前的 igb 驱动**完全没有 AF_XDP 代码**（没有 `xsk`、没有 `ndo_xsk_wakeup`），6.14 才加入（含 zero-copy）。6.8 上 XDP 程序能挂成 native，但 XSK redirect 不工作：VPP rx=0，内核也收不到包，WAN 直接断。已实测排除队列数（8/1 队列）和 memlock（4GB）因素。
+
+**SSH punt**：af_packet 下内核仍能收包，SSH 不受影响；切到 AF_XDP 后必须按第 6 节配 `vpp-punt` + `set punt tcp all` + `ip punt redirect`，否则 SSH 直接断。
+
+**切换 watchdog**：见 6.2.1，切换失败会自动回滚。
 
 4. 内部 app 地址（纯 VPP）+ 一条只给 API 用的内核 TUN：
 
@@ -1053,6 +1067,16 @@ ip route get 8.8.8.8 from 184.107.84.201
 ```
 
 预期：普通出站走 `tun-web`；源地址为公网 IP 的 SSH 回包走 `tun-punt`。
+
+### 6.2.1 WAN 切换 watchdog
+
+`/usr/local/sbin/wan-watchdog.sh` + `wan-watchdog.service`（已安装并 enable）：
+
+- 每 10s 检查一次 `https://api.deepseek.com`（失败再回退到 gateway ping）。
+- 只有 `/run/wan-cutover` 存在时才生效，正常环境不会误杀。
+- 连续 3 次失败：kill VPP、`xdp-loader unload enp2s0f0 -a`、`ip link set enp2s0f0 xdp off`、恢复 f0 地址/默认路由、删除标记。
+- 日志：`/var/log/wan-watchdog.log`。
+- 实测：AF_XDP 切换失败时约 30s 自动回滚，WAN 恢复。
 
 ### 6.3 Emby systemd 与剩余 Docker
 

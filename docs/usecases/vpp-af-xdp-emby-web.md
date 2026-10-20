@@ -11,11 +11,11 @@
 - 其他 Docker 服务（openlist、metatube、Prowlarr、Whisparr、av-subscriber）不在本次 Emby 迁移范围内；如果目标是彻底移除 Docker，需要单独逐项迁移。
 - Codex app-server 当前使用 `--listen unix://`，只有 Unix socket。推荐让它只监听 `ws://127.0.0.1:8790`，本地通过 SSH 本地端口转发访问；这样 app-server 不需要单独做公网 punt，SSH 隧道本身就走在 punt 路径上。
 - `vpp-web` TUN 只属于“保留内核 TCP”的路线。Phase 1/2 都是 **external app（nginx VCL）+ internal app（VPP media plugin）**：客户端到 nginx、nginx 到 internal app 都走 VPP host stack，不需要 `vpp-web` TUN。只有 nginx -> 真实 Emby 的 `127.0.0.1:8096` 那一段仍是内核 loopback。
-- **当前优先 Phase 0：隔离 lab + 裸 HTTP internal app。** 独立 VPP 实例 + veth + `af_packet`，不碰现有 Caddy/Docker/Emby/`enp2s0f0`；AF_XDP 和 SSH punt 后置到 Phase 3。
+- **当前优先 Phase 0：隔离 lab + 裸 HTTP internal app。** 独立 VPP 实例 + veth + `af_packet`，不碰现有 Caddy/Docker/Emby/`enp2s0f0`。Phase 2 直接上 **AF_XDP copy 模式**，SSH punt 同步完成；`af_packet` 只保留给 Phase 0 lab 和排障对照。
 - 推荐顺序：Phase 0 隔离 lab + 裸 HTTP 验证 -> Phase 1 本机 TUN 验证混合路由（nginx VCL + VPP internal app，纯 HTTP）-> Phase 2 同一套接到公网（TLS + `pornvpp.linqiankai.top` + 停 Caddy）-> Phase 3 AF_XDP + 强制 SSH punt。
 - `pornvpp.linqiankai.top` 的 A 记录已生效（`184.107.84.201`），Let's Encrypt HTTP-01 证书已签发：
   `/etc/letsencrypt/live/pornvpp.linqiankai.top/{fullchain.pem,privkey.pem}`，ECDSA，有效期到 2027-01-17；Caddy 已恢复。
-- Phase 0/1 的 lab 构建实测插件集：`af_packet,tap,http,http_static`（`./configure -P af_packet,tap,http,http_static -D none -S none -E none`），已包含 `vppctl` 和 VCL 库（`libvcl_ldpreload.so`）。Phase 3 再切 `af_xdp`，并补 `linux_cp/linux_nl/nat`。
+- Phase 0/1 的 lab 构建实测插件集：`af_packet,tap,http,http_static`（`./configure -P af_packet,tap,http,http_static -D none -S none -E none`），已包含 `vppctl` 和 VCL 库（`libvcl_ldpreload.so`）。Phase 2 切 `af_xdp`（I350 只能 `no-zero-copy`），并补 `linux_cp/linux_nl/nat/ip_session_redirect`。
 
 ## 1. 现状盘点
 
@@ -171,7 +171,7 @@ control sock /root/.codex/app-server-control/app-server-control.sock
 1. **Phase 0**：隔离 lab 环境。用独立 VPP 实例 + veth/测试接口 + `af_packet`（或 Linux-CP）把链路跑通；不动 `enp2s0f0` 上的现有服务。
 2. **Phase 1**：本机验证混合路由。external nginx（VCL/LDP）+ VPP internal media app，入口是 `tap` 插件的 TUN 接口 + **裸 HTTP**，在服务器本机用 curl 验证播放后端与路由。不动 WAN、不停 Caddy、不用证书。
 3. **Phase 2**：把 Phase 1 的同一套 nginx 和路由表接到公网入口：VPP 接管 `enp2s0f0`，域名 `pornvpp.linqiankai.top`，TLS 在 VPP host stack 上终止。功能代码与 Phase 1 完全相同，只改入口。
-4. **Phase 3**：`af_packet` 换成 AF_XDP；**SSH punt 必做**，不是可选。
+4. **Phase 3**：性能与加固（可选）：压测、调 worker/队列、评估 DPDK 与 linux-cp。AF_XDP 和 SSH punt 已在 Phase 2 完成。
 5. TCP 使用 BBR + RACK/TLP：Phase 0 的 Linux 侧用内核参数；Phase 1 的 VPP TCP 用 `tcp { cc-algo bbr rack }`。
 6. 从本地通过 SSH 隧道访问 Codex app-server。
 7. 全程可回滚；新环境与旧环境隔离。
@@ -686,7 +686,7 @@ Phase 2 **不改任何功能代码**，只把 Phase 1 的入口从 lab 换成公
 |---|---|---|
 | 监听 | `10.10.0.1:80`，纯 HTTP | `184.107.84.201:443`，TLS |
 | 域名 | 无，本机直连 `10.10.0.1` | `pornvpp.linqiankai.top` |
-| WAN 网卡 | 内核持有，不动 | VPP `af_packet` 绑 `enp2s0f0`，内核地址 flush |
+| WAN 网卡 | 内核持有，不动 | VPP `af_xdp`（copy 模式）接管 `enp2s0f0`，内核地址 flush |
 | Caddy | 保持运行，互不干扰 | 临时停止（同一 IP:443 冲突） |
 | nginx 配置 | 见 3.1 | 只改 `listen` / `server_name` / 证书三处 |
 | 路由表、internal app | 3.1 的实现 | **完全相同** |
@@ -733,16 +733,20 @@ ip addr flush dev enp2s0f0
 ip link set enp2s0f0 up
 ```
 
-3. 启动 VPP lab（`af_packet` 绑 `enp2s0f0`）：
+3. 用 AF_XDP 接管 `enp2s0f0`（I350 不支持 zero-copy，用 copy 模式）：
 
 ```text
-create host-interface name enp2s0f0
-set interface state host-enp2s0f0 up
-set interface ip address host-enp2s0f0 184.107.84.201/26
-ip route add 0.0.0.0/0 via 184.107.84.254 host-enp2s0f0
+create interface af_xdp host-if enp2s0f0 name wan0 no-zero-copy
+set interface state wan0 up
+set interface ip address wan0 184.107.84.201/26
+ip route add 0.0.0.0/0 via 184.107.84.254 wan0
 # ARP 不解析时，用第 2 步的 MAC 加静态邻居：
-# ip neighbor add 184.107.84.254 <gateway-mac> host-enp2s0f0
+# ip neighbor add 184.107.84.254 <gateway-mac> wan0
 ```
+
+为什么 Phase 2 不用 `af_packet`：af_packet 每个包都要经过内核网络栈并多一次拷贝，CPU 和延迟都明显高于 AF_XDP。I350 虽然没有 zero-copy，但 AF_XDP copy 模式仍然绕过内核网络栈；1GbE 场景跑满线速没问题，CPU 占用也低得多。`af_packet` 只用在 Phase 0 的隔离 lab。
+
+**SSH punt 必须在 Phase 2 同步完成**：AF_XDP 接管网卡后内核收不到 WAN 包，SSH 会直接断。按第 6 节创建 `vpp-punt` TAP、`set punt tcp all` 和 `ip punt redirect`，并先验证 SSH 可登录再继续。
 
 4. 内部 app 地址（纯 VPP）+ 一条只给 API 用的内核 TUN：
 
@@ -814,7 +818,7 @@ ip route add default via 184.107.84.254 dev enp2s0f0 onlink
 systemctl start caddy
 ```
 
-注意：`af_packet` 绑物理口是临时测试；如果收包/ARP 行为不稳定，直接提前切 AF_XDP，并按 Phase 3 强制启用 SSH punt。
+注意：Phase 2 直接用 AF_XDP copy 模式，`af_packet` 只用于 Phase 0 lab。SSH punt 不是 Phase 3 的事，必须在 Phase 2 一起做完并验证。
 
 nginx VCL 配置骨架：
 
@@ -858,14 +862,14 @@ VCL_CONFIG=/etc/vpp/vcl.conf \
 nginx -g 'daemon off;'
 ```
 
-### 3.3 Phase 3：AF_XDP + SSH punt（强制）
+### 3.3 Phase 3：性能与加固（可选）
 
-Phase 2 稳定后再做：
+Phase 2 已经用 AF_XDP copy 模式接管 WAN，SSH punt 也已启用。Phase 3 只做可选优化：
 
-- 把 `af_packet` 替换为 AF_XDP（I350 只能 copy 模式）。
-- **SSH punt 是 AF_XDP 替换后的必选项，不是可选项。** AF_XDP 接管 NIC 后，内核不再直接收 WAN 包，必须把 SSH 流量显式送到内核：`vpp-punt` + `set punt tcp all` + `ip punt redirect add rx wan0 via 10.30.0.2 vpp-punt`。
-- Linux-CP 可以继续负责控制面和部分 punt 流量，但 SSH 的 punt 规则必须明确配置并验证；不能依赖“LCP 可能覆盖”。
-- 如果不用 LCP，按第 6 节的 `vpp-punt`/NAT 方案切换（`vpp-web` 只保留作内核 TCP 对照，不采用）。
+- 压测 `af_xdp` copy 模式的 pps/CPU，按需增加 worker、调整 RX 队列和 `buffers-per-numa`。
+- 评估 DPDK：唯一能去掉拷贝的方案，但会独占网卡；单网卡机器上 SSH/管理流量必须全部走 punt，风险高。1GbE 场景不建议。
+- 评估 linux-cp：让内核接管 ARP/ND，减少手工邻居配置；SSH 的 TCP punt 规则仍然必须显式配置和验证。
+- SSH punt 回归测试（Phase 2 已启用，Phase 3 只验证和加固）。
 
 ## 4. 地址与端口规划
 
@@ -927,7 +931,7 @@ src/scripts/split-debug-symbols.sh build-vpp-release-afxdp-install
 | `linux_cp` + `linux_nl` | 控制面镜像 | 给 VPP 接口创建 Linux TAP/TUN 镜像，把 ARP/ND 等未转发流量 punt 给内核，并用 netlink 同步 IP 配置 |
 
 - 当前 lab（`tap` 插件 TUN）不需要 linux-cp，两端地址手工配好即可。
-- Phase 2 用 `af_packet` 绑 WAN 时，可以叠加 linux-cp 让内核继续处理 ARP/ND，但不是必须。
+- Phase 2 用 `af_xdp` 接管 WAN 时，可以叠加 linux-cp 让内核继续处理 ARP/ND，但不是必须。
 - Phase 3 切 AF_XDP 后，linux-cp 能覆盖 ARP/ND/未转发流量的 punt，但 **SSH 的 TCP punt 仍必须显式配置**，不能依赖 linux-cp。
 - 本仓库支持：`src/plugins/linux-cp/` 提供 `linux_cp`（CLI/API）和 `linux_nl`（netlink 同步）两个插件，状态是 experimental。
 - 构建时要显式加：`-P af_xdp,tap,nat,linux_cp,linux_nl`，并安装 `libnl-3-dev`、`libmnl-dev`；缺依赖时 CMake 只打 warning，插件会被静默跳过。

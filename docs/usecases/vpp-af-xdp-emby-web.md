@@ -953,6 +953,74 @@ ninja -C build-vpp-release-afxdp install
 src/scripts/split-debug-symbols.sh build-vpp-release-afxdp-install
 ```
 
+#### Phase 2 数据面：DPDK 26.07
+
+AF_XDP 在这个组合上放弃：VPP 的 `vlib_buffer_pool_t.alloc_size` 与 AF_XDP 的 `frame_size` 不一致（VPP 的 `vlib_buffer_alloc_size()` 会 `|= VLIB_BUFFER_ALIGN`），igb 又不消费非对齐 chunk。改用 DPDK。
+
+**安装 DPDK（系统级，不触发 VPP external 重编）**
+
+```bash
+curl -fL https://fast.dpdk.org/rel/dpdk-26.07.tar.xz -o /tmp/dpdk-26.07.tar.xz
+tar -xf /tmp/dpdk-26.07.tar.xz -C /opt
+# 关键补丁：16 个 ops 槽会被 PMD 注册满，VPP 的 "vpp" mempool ops 注册失败
+sed -i 's/#define RTE_MEMPOOL_MAX_OPS_IDX 16/#define RTE_MEMPOOL_MAX_OPS_IDX 64/' \
+  /opt/dpdk-26.07/lib/mempool/rte_mempool.h
+cd /opt/dpdk-26.07
+PATH=/usr/bin:$PATH meson setup build --prefix=/opt/dpdk --buildtype=release \
+  -Dplatform=generic -Denable_docs=false -Dtests=false
+PATH=/usr/bin:$PATH ninja -C build -j$(nproc)
+PATH=/usr/bin:$PATH ninja -C build install
+echo /opt/dpdk/lib/x86_64-linux-gnu > /etc/ld.so.conf.d/dpdk.conf && ldconfig
+```
+
+**VPP 配置与构建**
+
+```bash
+PKG_CONFIG_PATH=/opt/dpdk/lib/x86_64-linux-gnu/pkgconfig \
+cmake -G Ninja -DCMAKE_BUILD_TYPE=release \
+  -DVPP_USE_SYSTEM_DPDK=ON -DDPDK_SRC_DIR=/opt/dpdk-26.07 \
+  -DVPP_PLUGINS=af_packet,tap,http,http_static,media_server,nat,linux_cp,linux_cp_unittest,linux_nl,ip_session_redirect,dpdk \
+  -S src -B build-vpp-lab
+ninja -C build-vpp-lab
+```
+
+`src/plugins/dpdk/CMakeLists.txt` 的 system-DPDK 分支额外加了 DPDK 源码树里的内部头文件路径和
+`link_directories(${DPDK_LIBRARY_DIRS})`，否则会误链系统旧版 DPDK。验证：
+
+```bash
+readelf -d build-vpp-lab/lib/x86_64-linux-gnu/vpp_plugins/dpdk_plugin.so | grep rte_eal
+# 应为 librte_eal.so.26
+```
+
+**绑定与启动**
+
+```bash
+modprobe vfio-pci
+dpdk-devbind.py --bind=vfio-pci 0000:02:00.1    # enp2s0f1，测试口
+```
+
+```text
+dpdk {
+  dev 0000:02:00.1
+}
+```
+
+```text
+set interface state GigabitEthernet2/0/1 up
+```
+
+实测：1 Gbps、carrier up full duplex、RX 计数增长。`enp2s0f0`（WAN）仍由内核 `igb` 持有，未动。
+
+**切 f0 的前提**
+
+DPDK 会独占网卡，内核在 f0 上**连 TX 也没有了**。之前基于 AF_XDP 的 punt 设计假设内核还能用 f0 回包，这个前提不再成立。切 f0 前必须改为：
+
+- 内核的 WAN 地址移到 `vpp-punt` TAP（或 dummy），默认路由指向 `10.30.0.1`；
+- VPP 对内核流量做 NAT44 SNAT；
+- SSH punt 到 `vpp-punt`，回包经 VPP 出 WAN。
+
+在这套 punt/NAT 配好并验证前，f0 保持内核 `igb`，DPDK 只在 f1 上验证。
+
 #### Linux-CP 与 af_packet/af_xdp 的关系
 
 两者不是二选一，是不同层：

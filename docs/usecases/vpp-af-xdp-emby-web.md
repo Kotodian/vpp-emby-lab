@@ -917,6 +917,22 @@ ninja -C build-vpp-release-afxdp install
 src/scripts/split-debug-symbols.sh build-vpp-release-afxdp-install
 ```
 
+#### Linux-CP 与 af_packet/af_xdp 的关系
+
+两者不是二选一，是不同层：
+
+| 组件 | 层 | 作用 |
+|---|---|---|
+| `af_packet` / `af_xdp` | 数据面驱动 | 把 Linux netdev（如 `enp2s0f0`）接进 VPP |
+| `linux_cp` + `linux_nl` | 控制面镜像 | 给 VPP 接口创建 Linux TAP/TUN 镜像，把 ARP/ND 等未转发流量 punt 给内核，并用 netlink 同步 IP 配置 |
+
+- 当前 lab（`tap` 插件 TUN）不需要 linux-cp，两端地址手工配好即可。
+- Phase 2 用 `af_packet` 绑 WAN 时，可以叠加 linux-cp 让内核继续处理 ARP/ND，但不是必须。
+- Phase 3 切 AF_XDP 后，linux-cp 能覆盖 ARP/ND/未转发流量的 punt，但 **SSH 的 TCP punt 仍必须显式配置**，不能依赖 linux-cp。
+- 本仓库支持：`src/plugins/linux-cp/` 提供 `linux_cp`（CLI/API）和 `linux_nl`（netlink 同步）两个插件，状态是 experimental。
+- 构建时要显式加：`-P af_xdp,tap,nat,linux_cp,linux_nl`，并安装 `libnl-3-dev`、`libmnl-dev`；缺依赖时 CMake 只打 warning，插件会被静默跳过。
+- 用法：`lcp create enp2s0f0 host-if wan0`，然后在 Linux 侧配置 `wan0`。
+
 ### 5.2 Hugepages
 
 当前 hugepages 为 0。建议先分配 4 GB（2 MB × 2048）：

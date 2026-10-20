@@ -569,17 +569,55 @@ vpp.http_static_enable_v5(
 
 **注意**：Phase 0 实测 `http_static` **不实现 `Range`** —— 带 `Range: bytes=0-1048575` 的请求仍返回 `200` + 整个文件。Phase 1 必须换成下面的 `media_server` 才有 `206`，否则 Emby 无法拖动进度。
 
-#### Handler 与实现
+#### 插件边界与 206 支持
 
-MVP 直接扩展 `src/plugins/http_static/`，新增 `media_server.c`：
+不要把媒体业务写进 `http_static`。分层如下：
+
+| 层 | 组件 | 职责 |
+|---|---|---|
+| 传输 | `http` 插件 + session | HTTP 解析/序列化、TLS、连接管理 |
+| 通用静态文件 | `http_static` | 目录映射、缓存、通用 Range/206 语义 |
+| 业务 | 独立插件 `media_server` | itemId -> 路径索引、`/media` `/hls` 路由、路径安全、鉴权头 |
+
+`media_server` 是独立插件（`src/plugins/media_server/`），通过 `http_static` 的公开接口 `hss_register_url_handler()` 挂 URL，业务代码不进入 `http_static`。
+
+**206 现状**：`http` 层已经定义了 `HTTP_STATUS_PARTIAL_CONTENT`、`HTTP_HEADER_CONTENT_RANGE`、`HTTP_HEADER_ACCEPT_RANGES`、`HTTP_HEADER_RANGE`，但还缺两块通用能力：
+
+1. `http_static` 的静态文件路径没有解析 Range。需要补：解析 `Range: bytes=a-b`，返回 `206` + `Content-Range`；无 Range 时返回 `Accept-Ranges: bytes`；越界返回 `416`。
+2. `hss_url_handler_args_t` 的 reply 只能设置 `sc`/`ct`/`data`，不能加 `Content-Range`。需要给 reply 增加 `headers` 字段（预格式化 header 块），让任何 handler 都能设置响应头。`sc` 已经能设 `206`。
+
+这两处都是 HTTP 语义，与媒体无关；补完后独立插件就能直接做 206，不需要改 `http_static` 的业务代码。
+
+**media_server 职责**（独立插件）：
 
 - `GET /health`：返回 `{"status":"ok"}`。
-- `GET /media/<path>`：映射到 `/srv/media/<path>`，严格拒绝 `..`、绝对路径、符号链接逃逸。
+- `GET /media/<itemId>[/<file>]`：查内存索引 -> 打开文件 -> 按 Range 做 `pread`。
 - `GET /hls/<id>/<file>`：返回 `.m3u8`/`.m4s`/`.ts`。
-- `Range: bytes=start-end`：返回 `206`、`Content-Range`、`Accept-Ranges: bytes`；无 Range 返回 `200`。
-- 分块读取文件并通过 `hss_session_send_data`/`hss_session_send_fn` 发送；不要把整部电影读进内存。
+- 只做业务：索引、路径校验（拒绝 `..`、绝对路径、符号链接逃逸）、Range 参数换算；HTTP 解析/序列化交给 `http`/`http_static`。
+- 分块读取并发送，不要把整部电影读进内存。
 - `.m3u8`/`.m4s`/`.ts`/`.mp4` 设置正确 Content-Type。
-- 不要在 VPP worker 里做 ffmpeg/扫描；HLS 由外部 systemd 任务预生成到 `/srv/media/hls/`。
+- 不在 VPP worker 里做 ffmpeg/扫描；HLS 由外部 systemd 任务预生成。
+
+**构建**：
+
+```cmake
+add_vpp_plugin(media_server
+  SOURCES
+  media_server.c
+  LINK_LIBRARIES
+  http vnet vppinfra
+)
+```
+
+**注册**（启动时，先 enable `http_static` 再注册，否则会丢）：
+
+```c
+extern void hss_register_url_handler (hss_url_handler_fn fp, const char *url, int is_post);
+
+hss_register_url_handler (media_server_get_handler, "/media/", 0);
+hss_register_url_handler (media_server_get_handler, "/hls/", 0);
+hss_register_url_handler (media_server_get_handler, "/health", 0);
+```
 
 #### 验证
 
@@ -1715,31 +1753,29 @@ SSH: punt 到 tun-punt -> 内核 sshd
 
 这里没有 `vpp-web` TUN：客户端 TCP 和 nginx -> internal app 都在 VPP host stack 内。
 
-### E.3 VPP 内部实现（推荐先扩展 `http_static`）
+### E.3 VPP 内部实现（独立 `media_server` 插件）
 
-`http_static` 已经是内建 host-stack HTTP 服务器，支持 GET/POST、LRU 缓存和可插拔 URL handler。MVP 直接给它加一个 `media` handler，避免跨插件初始化顺序问题：
+`http_static` 只作为 HTTP transport 和通用静态文件层；媒体业务放独立插件：
 
 ```text
-src/plugins/http_static/
-  media_server.c        # 新增：路径解析、Range、文件发送
-  media_index.c         # 可选：index.json 加载/刷新
-  CMakeLists.txt        # SOURCES 增加 media_server.c
+src/plugins/media_server/
+  media_server.c        # 路由、Range 参数换算、文件发送
+  media_index.c         # index.json 加载/刷新
+  CMakeLists.txt        # add_vpp_plugin(media_server ...)
 ```
 
 核心逻辑：
 
-1. 注册 `GET /media/` 和 `GET /hls/` 路径（或扩展 `static_server.c` 的文件路径）。
+1. 通过 `hss_register_url_handler()` 注册 `/media/`、`/hls/`、`/health`；注册前必须先 enable `http_static`，否则 handler 会丢。
 2. 严格限制根目录为 `/srv/media`，拒绝 `..`、绝对路径、符号链接逃逸。
-3. 解析 `Range: bytes=start-end`，返回 `206 Partial Content`、`Content-Range`、`Accept-Ranges: bytes`。
-4. 分块读取文件并通过 `hss_session_send_data`/`hss_session_send_fn` 发送；不要在 worker 里一次性读几 GB。
+3. Range/206 是 transport 的通用能力：`http_static` 解析 `Range` 并返回 206，handler 通过 reply 的 `headers` 设置 `Content-Range`。业务插件只负责把 `start-end` 换算成文件偏移。
+4. 分块读取文件并通过 transport 发送；不要在 worker 里一次性读几 GB。
 5. 对 `.m3u8`、`.m4s`、`.ts`、`.mp4` 设置正确 `Content-Type`。
 6. 大文件不要依赖 `http_static` 的 LRU 缓存；缓存只用于小文件/索引。
 
-如果不想改 `http_static`，也可以新建 `media_server` 插件，用 `vlib_get_plugin_symbol("http_static_plugin.so", "hss_register_url_handler")` 注册 handler。但要注意 `docs/usecases/webapp.rst` 的顺序要求：先启动 `http_static`，再注册 handler，否则注册会丢失。MVP 更推荐直接扩展 `http_static`。
-
 ### E.4 启用 internal HTTP server
 
-`http_static` 目前主要通过二进制 API 启用（`http_static_enable_v5`），没有稳定的 CLI。MVP 写一个 `vpp_papi` bootstrap 脚本：
+Phase 0 验证了 CLI 可直接启用：`http static server ...` + `http static listener add ...`。需要自动化时也可以用二进制 API（`http_static_enable_v5`）：
 
 ```python
 from vpp_papi import VPPApiClient

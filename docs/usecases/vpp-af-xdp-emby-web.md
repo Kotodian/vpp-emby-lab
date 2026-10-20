@@ -1011,15 +1011,62 @@ set interface state GigabitEthernet2/0/1 up
 
 实测：1 Gbps、carrier up full duplex、RX 计数增长。`enp2s0f0`（WAN）仍由内核 `igb` 持有，未动。
 
-**切 f0 的前提**
+**f0 实测切换（已验证）**
 
-DPDK 会独占网卡，内核在 f0 上**连 TX 也没有了**。之前基于 AF_XDP 的 punt 设计假设内核还能用 f0 回包，这个前提不再成立。切 f0 前必须改为：
+DPDK 启动时会跳过 host interface 仍是 `IFF_UP` 的 PCI 设备（`vlib_pci_bind_to_uio`），所以顺序必须是：
 
-- 内核的 WAN 地址移到 `vpp-punt` TAP（或 dummy），默认路由指向 `10.30.0.1`；
-- VPP 对内核流量做 NAT44 SNAT；
-- SSH punt 到 `vpp-punt`，回包经 VPP 出 WAN。
+1. `ip link set enp2s0f0 down`
+2. 启动 VPP（`dpdk { dev 0000:02:00.0 }`），DPDK 绑定 f0，得到 `GigabitEthernet2/0/0`
+3. VPP 内：
+   ```text
+   create tap id 10 if-name punt0 host-if-name vpp-punt tun host-mtu-size 1500
+   set interface state punt0 up
+   set interface ip address punt0 10.30.0.1/30
+   set punt tcp all
+   set punt udp all
+   ip punt redirect add rx GigabitEthernet2/0/0 via 10.30.0.2 punt0
 
-在这套 punt/NAT 配好并验证前，f0 保持内核 `igb`，DPDK 只在 f1 上验证。
+   set interface state GigabitEthernet2/0/0 up
+   set interface ip address GigabitEthernet2/0/0 184.107.84.201/26
+   ip route add 0.0.0.0/0 via 184.107.84.254 GigabitEthernet2/0/0
+   ip neighbor GigabitEthernet2/0/0 184.107.84.254 00:1c:73:00:00:02
+   ```
+4. 内核：
+   ```bash
+   ip link set vpp-punt up
+   ip addr add 184.107.84.201/32 dev vpp-punt
+   ip addr add 10.30.0.2/30 dev vpp-punt
+   ip route add default via 10.30.0.1 dev vpp-punt src 184.107.84.201
+   sysctl -w net.ipv4.conf.vpp-punt.rp_filter=2
+   ```
+   源地址必须显式 `src 184.107.84.201`，否则内核会用 10.30.0.2 出 WAN。
+5. DNS：f0 消失后 systemd-resolved 没有上游，必须把上游挂到 vpp-punt：
+   ```bash
+   resolvectl dns vpp-punt 23.19.53.53 23.19.52.52
+   resolvectl domain vpp-punt '~.'
+   resolvectl default-route vpp-punt yes
+   ```
+   漏了这步的表现是：`ping` 网关正常，但 `curl https://域名` 返回 000。
+
+实测结果：
+
+- DPDK f0：1 Gbps、carrier up full duplex；
+- `tcp4-input Packets punted` 6000+，SSH 会话 `184.107.84.201:22` established；
+- `curl https://api.deepseek.com` 返回 401，DNS 正常；
+- 本机 Emby `127.0.0.1:8096` 仍返回 200。
+
+回滚：
+
+```bash
+pkill -x vpp_main
+ip link del vpp-punt 2>/dev/null
+dpdk-devbind.py --bind=igb 0000:02:00.0
+ip link set enp2s0f0 up
+ip addr add 184.107.84.201/26 dev enp2s0f0
+ip route add default via 184.107.84.254 dev enp2s0f0 onlink
+```
+
+watchdog 已按这套回滚实现，切换失败 30 秒内自动恢复。
 
 #### Linux-CP 与 af_packet/af_xdp 的关系
 

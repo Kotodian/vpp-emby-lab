@@ -31,6 +31,15 @@ hss_register_url_handler (hss_url_handler_fn fp, const char *url,
   url_table = (request_type == HTTP_REQ_GET) ? hsm->get_url_handlers :
 					       hsm->post_url_handlers;
 
+  if (url_table == 0)
+    {
+      url_table = hash_create_string (0, sizeof (uword));
+      if (request_type == HTTP_REQ_GET)
+	hsm->get_url_handlers = url_table;
+      else
+	hsm->post_url_handlers = url_table;
+    }
+
   p = hash_get_mem (url_table, url);
 
   if (p)
@@ -50,6 +59,42 @@ hss_register_url_handler (hss_url_handler_fn fp, const char *url,
     hsm->get_url_handlers = url_table;
   else
     hsm->post_url_handlers = url_table;
+}
+
+__clib_export void
+hss_register_url_handler_prefix (hss_url_handler_fn fp, const char *prefix,
+				 http_req_method_t request_type)
+{
+  hss_main_t *hsm = &hss_main;
+  uword *p, *url_table;
+
+  url_table = (request_type == HTTP_REQ_GET) ?
+		hsm->get_url_prefix_handlers :
+		hsm->post_url_prefix_handlers;
+
+  if (url_table == 0)
+    {
+      url_table = hash_create_string (0, sizeof (uword));
+      if (request_type == HTTP_REQ_GET)
+	hsm->get_url_prefix_handlers = url_table;
+      else
+	hsm->post_url_prefix_handlers = url_table;
+    }
+
+  p = hash_get_mem (url_table, prefix);
+  if (p)
+    {
+      clib_warning ("WARNING: attempt to replace handler for %s '%s' ignored",
+		    (request_type == HTTP_REQ_GET) ? "GET" : "POST", prefix);
+      return;
+    }
+
+  hash_set_mem (url_table, prefix, (uword) fp);
+
+  if (request_type == HTTP_REQ_GET)
+    hsm->get_url_prefix_handlers = url_table;
+  else
+    hsm->post_url_prefix_handlers = url_table;
 }
 
 /** \brief API helper function for vl_api_http_static_enable_t messages

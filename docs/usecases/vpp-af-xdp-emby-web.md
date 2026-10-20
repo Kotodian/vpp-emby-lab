@@ -609,15 +609,28 @@ add_vpp_plugin(media_server
 )
 ```
 
-**注册**（启动时，先 enable `http_static` 再注册，否则会丢）：
+**注册**（实现已落地在 `src/plugins/media_server/`）：
 
 ```c
-extern void hss_register_url_handler (hss_url_handler_fn fp, const char *url, int is_post);
+/* http1 解析出的 target_path 不带前导 '/'，注册键也必须不带 */
+extern void hss_register_url_handler (hss_url_handler_fn fp, const char *url,
+				      int is_post);
+extern void hss_register_url_handler_prefix (hss_url_handler_fn fp,
+					     const char *prefix, int is_post);
 
-hss_register_url_handler (media_server_get_handler, "/media/", 0);
-hss_register_url_handler (media_server_get_handler, "/hls/", 0);
-hss_register_url_handler (media_server_get_handler, "/health", 0);
+hss_register_url_handler (media_server_get_handler, "health", 0);
+hss_register_url_handler_prefix (media_server_get_handler, "media/", 0);
+hss_register_url_handler_prefix (media_server_get_handler, "hls/", 0);
 ```
+
+两个容易踩的点：
+
+- listener 必须带 `url-handlers`（`http static listener add ... url-handlers`），否则 `try_url_handler` 根本不会被调用。
+- 注册键不要写 `/media/`，要写 `media/`；http1 解析器交给 app 的 `target_path` 是 `"media/x"`。
+
+**Range 由 transport 统一处理**：handler 只需要返回完整 body（`args->data`/`args->data_len`）+ `200`，`hss_session_send_data()` 会读请求里的 `Range`，自动切成 `206` + `Content-Range`，越界返回 `416`。业务插件不解析 Range。
+
+已实测（`build-vpp-lab`）：`health` 返回 200，`media/test.mp4` 的 `Range: bytes=100-199` 返回 `206` + `Content-Range: bytes 100-199/4194304`，`--path-as-is /media/../etc/passwd` 返回 404。
 
 #### 验证
 

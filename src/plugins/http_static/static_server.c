@@ -57,6 +57,116 @@ hss_add_header (hss_session_t *hs, http_header_name_t name, const char *value,
   return 0;
 }
 
+static int
+hss_add_custom_header (hss_session_t *hs, const char *name, uword name_len,
+		       const char *value, uword value_len)
+{
+  u32 needed_size = 0;
+  while (http_add_custom_header (&hs->resp_headers, name, name_len, value,
+				 value_len) == -1)
+    {
+      if (needed_size)
+	{
+	  http_truncate_headers_list (&hs->resp_headers);
+	  hs->data_len = 0;
+	  return -1;
+	}
+      needed_size = hs->resp_headers.tail_offset +
+		    sizeof (http_app_header_name_t) + name_len +
+		    sizeof (http_custom_token_t) + value_len;
+      if (needed_size < HSS_HEADER_BUF_MAX_SIZE)
+	{
+	  vec_resize (hs->headers_buf, needed_size);
+	  hs->resp_headers.len = needed_size;
+	  hs->resp_headers.buf = hs->headers_buf;
+	}
+      else
+	{
+	  http_truncate_headers_list (&hs->resp_headers);
+	  hs->data_len = 0;
+	  return -1;
+	}
+    }
+  return 0;
+}
+
+/*
+ * Parse a single "Range: bytes=..." value.
+ *
+ * Returns 0 on success, -1 if the header should be ignored (malformed or
+ * multiple ranges) and 1 if the range is not satisfiable.
+ */
+static int
+hss_parse_range (u8 *value, uword value_len, u64 file_len, u64 *start,
+		 u64 *end)
+{
+  static const char pfx[] = "bytes=";
+  u64 a = 0, b = 0;
+  uword i;
+  u8 have_a = 0, have_b = 0;
+
+  if (value_len < sizeof (pfx) - 1)
+    return -1;
+
+  for (i = 0; i < sizeof (pfx) - 1; i++)
+    if ((value[i] | 0x20) != pfx[i])
+      return -1;
+
+  i = sizeof (pfx) - 1;
+
+  /* Multiple ranges are not supported; fall back to a full response. */
+  for (uword j = i; j < value_len; j++)
+    if (value[j] == ',')
+      return -1;
+
+  while (i < value_len && value[i] == ' ')
+    i++;
+
+  if (i < value_len && value[i] == '-')
+    {
+      i++;
+      for (; i < value_len && value[i] >= '0' && value[i] <= '9'; i++)
+	{
+	  b = b * 10 + (value[i] - '0');
+	  have_b = 1;
+	}
+      if (!have_b || b == 0 || file_len == 0)
+	return 1;
+      *start = (b >= file_len) ? 0 : file_len - b;
+      *end = file_len - 1;
+      return 0;
+    }
+
+  for (; i < value_len && value[i] >= '0' && value[i] <= '9'; i++)
+    {
+      a = a * 10 + (value[i] - '0');
+      have_a = 1;
+    }
+  if (!have_a)
+    return -1;
+  if (i >= value_len || value[i] != '-')
+    return -1;
+  i++;
+  for (; i < value_len && value[i] >= '0' && value[i] <= '9'; i++)
+    {
+      b = b * 10 + (value[i] - '0');
+      have_b = 1;
+    }
+
+  if (a >= file_len)
+    return 1;
+  *start = a;
+  if (have_b)
+    {
+      if (b < a)
+	return 1;
+      *end = clib_min (b, file_len - 1);
+    }
+  else
+    *end = file_len - 1;
+  return 0;
+}
+
 static_always_inline void
 hss_confirm_data_read (hss_session_t *hs, u32 n_last_deq)
 {
@@ -128,6 +238,7 @@ start_send_data (hss_session_t *hs, http_status_code_t status)
   hss_main_t *hsm = &hss_main;
   http_msg_t msg;
   session_t *ts;
+  u64 body_len;
   u32 n_enq;
   u64 to_send;
   int rv;
@@ -139,7 +250,10 @@ start_send_data (hss_session_t *hs, http_status_code_t status)
 
   msg.type = HTTP_MSG_REPLY;
   msg.code = status;
-  msg.data.body_len = hs->data_len;
+  body_len = hs->data_end > hs->data_offset ?
+	       hs->data_end - hs->data_offset :
+	       0;
+  msg.data.body_len = body_len;
   msg.data.headers_offset = 0;
   msg.data.headers_len = hs->resp_headers.tail_offset;
   msg.data.len = msg.data.body_len + msg.data.headers_len;
@@ -161,7 +275,7 @@ start_send_data (hss_session_t *hs, http_status_code_t status)
       if (!msg.data.body_len)
 	goto done;
 
-      uword data = pointer_to_uword (hs->data);
+      uword data = pointer_to_uword (hs->data + hs->data_offset);
       rv = svm_fifo_enqueue (ts->tx_fifo, sizeof (data), (u8 *) &data);
       ASSERT (rv == sizeof (data));
 
@@ -184,14 +298,15 @@ start_send_data (hss_session_t *hs, http_status_code_t status)
   if (!msg.data.body_len)
     goto done;
 
-  to_send = hs->data_len;
+  to_send = body_len;
   n_enq = clib_min (svm_fifo_size (ts->tx_fifo), to_send);
 
-  rv = svm_fifo_enqueue (ts->tx_fifo, n_enq, hs->data);
+  rv = svm_fifo_enqueue (ts->tx_fifo, n_enq, hs->data + hs->data_offset);
 
   if (rv < to_send)
     {
-      hs->data_offset = (rv > 0) ? rv : 0;
+      if (rv > 0)
+	hs->data_offset += rv;
       svm_fifo_add_want_deq_ntf (ts->tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
     }
 
@@ -215,7 +330,71 @@ hss_session_send_data (hss_url_handler_args_t *args)
 
   hs->data = args->data;
   hs->data_len = args->data_len;
+  hs->data_offset = 0;
+  hs->data_end = args->data_len;
   hs->free_data = args->free_vec_data;
+
+  /*
+   * Range is transport semantics: apply it to any successful response,
+   * so handlers do not have to implement it.
+   */
+  if (args->sc == HTTP_STATUS_OK && hs->data_len &&
+      hs->req_headers.value_by_name)
+    {
+      const http_token_t *range =
+	http_get_header (&hs->req_headers, "range", 5);
+      if (range)
+	{
+	  u64 rs = 0, re = 0;
+	  u8 *cr;
+	  int rr;
+
+	  rr = hss_parse_range ((u8 *) range->base, range->len, hs->data_len,
+				&rs, &re);
+	  if (rr == 1)
+	    {
+	      hs->data_end = 0;
+	      args->sc = HTTP_STATUS_RANGE_NOT_SATISFIABLE;
+	      cr = format (0, "bytes */%llu",
+			   (unsigned long long) hs->data_len);
+	    }
+	  else if (rr == 0)
+	    {
+	      hs->data_offset = rs;
+	      hs->data_end = re + 1;
+	      args->sc = HTTP_STATUS_PARTIAL_CONTENT;
+	      cr = format (0, "bytes %llu-%llu/%llu", (unsigned long long) rs,
+			   (unsigned long long) re,
+			   (unsigned long long) hs->data_len);
+	    }
+	  else
+	    cr = 0;
+
+	  if (cr)
+	    {
+	      hss_add_header (hs, HTTP_HEADER_CONTENT_RANGE, (char *) cr,
+			      vec_len (cr));
+	      vec_free (cr);
+	    }
+	}
+    }
+
+  if (args->sc == HTTP_STATUS_OK || args->sc == HTTP_STATUS_PARTIAL_CONTENT)
+    hss_add_header (hs, HTTP_HEADER_ACCEPT_RANGES, "bytes", 5);
+
+  if (args->headers)
+    {
+      hss_resp_header_t *h;
+      vec_foreach (h, args->headers)
+	{
+	  if (hss_add_custom_header (hs, (const char *) h->name, h->name_len,
+				     (const char *) h->value, h->value_len))
+	    {
+	      args->sc = HTTP_STATUS_INTERNAL_ERROR;
+	      break;
+	    }
+	}
+    }
 
   /* Set content type only if we have some response data */
   if (hs->data_len)
@@ -295,6 +474,7 @@ static int
 try_url_handler (hss_session_t *hs)
 {
   hss_main_t *hsm = &hss_main;
+
   http_status_code_t sc = HTTP_STATUS_OK;
   hss_url_handler_args_t args = {};
   uword *p, *url_table;
@@ -319,6 +499,28 @@ try_url_handler (hss_session_t *hs)
     (hs->rt == HTTP_REQ_GET) ? hsm->get_url_handlers : hsm->post_url_handlers;
 
   p = hash_get_mem (url_table, target_path);
+  if (!p)
+    {
+      /* No exact match, look for the longest registered prefix */
+      uword *prefix_table = (hs->rt == HTTP_REQ_GET) ?
+			      hsm->get_url_prefix_handlers :
+			      hsm->post_url_prefix_handlers;
+      hash_pair_t *hp, *best = 0;
+      uword best_len = 0;
+
+      hash_foreach_pair (hp, prefix_table, ({
+	u8 *prefix = uword_to_pointer (hp->key, u8 *);
+	uword plen = strlen ((char *) prefix);
+	if (plen > best_len && plen <= vec_len (target_path) &&
+	    !memcmp (target_path, prefix, plen))
+	  {
+	    best = hp;
+	    best_len = plen;
+	  }
+      }));
+      if (best)
+	p = best->value;
+    }
   if (!p)
     return -1;
 
@@ -370,6 +572,7 @@ try_url_handler (hss_session_t *hs)
 		  target_path);
 
   args.req_type = hs->rt;
+  args.target_path = target_path;
   args.query = hs->target_query;
   args.req_data = hs->rx_buff;
   args.sh.thread_index = hs->thread_index;
@@ -555,22 +758,73 @@ try_file_handler (hss_session_t *hs)
 
   hs->path = path;
   hs->cache_pool_index = ce_index;
+  hs->data_offset = 0;
+  hs->data_end = hs->data_len;
+
+  /*
+   * Range support. Only a single range is handled; malformed or
+   * multi-range requests fall back to a normal 200 response.
+   */
+  {
+    const http_token_t *range =
+      hs->req_headers.value_by_name ?
+	http_get_header (&hs->req_headers, "range", 5) :
+	0;
+    if (range && hs->data_len)
+      {
+	u64 rs = 0, re = 0;
+	int rr;
+
+	rr = hss_parse_range ((u8 *) range->base, range->len, hs->data_len,
+			      &rs, &re);
+	if (rr == 1)
+	  {
+	    u8 *cr;
+
+	    hs->data_end = 0;
+	    sc = HTTP_STATUS_RANGE_NOT_SATISFIABLE;
+	    cr = format (0, "bytes */%llu", (unsigned long long) hs->data_len);
+	    hss_add_header (hs, HTTP_HEADER_CONTENT_RANGE, (char *) cr,
+			    vec_len (cr));
+	    vec_free (cr);
+	  }
+	else if (rr == 0)
+	  {
+	    u8 *cr;
+
+	    hs->data_offset = rs;
+	    hs->data_end = re + 1;
+	    sc = HTTP_STATUS_PARTIAL_CONTENT;
+	    cr = format (0, "bytes %llu-%llu/%llu", (unsigned long long) rs,
+			 (unsigned long long) re,
+			 (unsigned long long) hs->data_len);
+	    hss_add_header (hs, HTTP_HEADER_CONTENT_RANGE, (char *) cr,
+			    vec_len (cr));
+	    vec_free (cr);
+	  }
+      }
+  }
 
   /* Set following headers only for happy path:
    * Content-Type
    * Cache-Control max-age
    * Last-Modified
    */
-  type = content_type_from_request (sanitized_path);
-  if (hss_add_header (hs, HTTP_HEADER_CONTENT_TYPE,
-		      http_content_type_token (type)) ||
-      hss_add_header (hs, HTTP_HEADER_CACHE_CONTROL,
-		      (const char *) l->max_age_formatted,
-		      vec_len (l->max_age_formatted)) ||
-      hss_add_header (hs, HTTP_HEADER_LAST_MODIFIED,
-		      (const char *) last_modified, vec_len (last_modified)))
+  if (sc == HTTP_STATUS_OK || sc == HTTP_STATUS_PARTIAL_CONTENT)
     {
-      sc = HTTP_STATUS_INTERNAL_ERROR;
+      type = content_type_from_request (sanitized_path);
+      if (hss_add_header (hs, HTTP_HEADER_CONTENT_TYPE,
+			  http_content_type_token (type)) ||
+	  hss_add_header (hs, HTTP_HEADER_CACHE_CONTROL,
+			  (const char *) l->max_age_formatted,
+			  vec_len (l->max_age_formatted)) ||
+	  hss_add_header (hs, HTTP_HEADER_LAST_MODIFIED,
+			  (const char *) last_modified,
+			  vec_len (last_modified)) ||
+	  hss_add_header (hs, HTTP_HEADER_ACCEPT_RANGES, "bytes", 5))
+	{
+	  sc = HTTP_STATUS_INTERNAL_ERROR;
+	}
     }
 
 done:
@@ -660,6 +914,8 @@ hss_ts_rx_callback (session_t *ts)
 
   hs->data = 0;
   hs->data_len = 0;
+  hs->data_end = 0;
+  hs->data_offset = 0;
   vec_free (hs->target_path);
   vec_free (hs->target_query);
   vec_free (hs->authority);
@@ -734,6 +990,26 @@ hss_ts_rx_callback (session_t *ts)
       svm_fifo_dequeue_drop (ts->rx_fifo, msg.data.body_offset);
     }
 
+  /*
+   * Build a parsed view of the request headers. headers_ctx points at the
+   * field lines produced by the http plugin, which is still alive here.
+   */
+  if (hs->req_headers.value_by_name)
+    http_free_header_table (&hs->req_headers);
+  clib_memset (&hs->req_headers, 0, sizeof (hs->req_headers));
+  hs->req_msg = msg;
+  if (msg.data.headers_len && msg.data.headers_ctx)
+    {
+      vec_validate (hs->req_headers_buf, msg.data.headers_len - 1);
+      rv = svm_fifo_peek (ts->rx_fifo, msg.data.headers_offset,
+			  msg.data.headers_len, hs->req_headers_buf);
+      ASSERT (rv == msg.data.headers_len);
+      http_init_header_table_buf (&hs->req_headers, msg);
+      clib_memcpy (hs->req_headers.buf, hs->req_headers_buf,
+		   msg.data.headers_len);
+      http_build_header_table (&hs->req_headers, msg);
+    }
+
   /* Find and send data */
   handle_request (hs);
   goto done;
@@ -757,7 +1033,9 @@ hss_ts_tx_callback (session_t *ts)
   if (!hs || !hs->data)
     return 0;
 
-  to_send = hs->data_len - hs->data_offset;
+  to_send = hs->data_end > hs->data_offset ?
+	      hs->data_end - hs->data_offset :
+	      0;
   n_enq = clib_min (svm_fifo_size (ts->tx_fifo), to_send);
 
   rv = svm_fifo_enqueue (ts->tx_fifo, n_enq, hs->data + hs->data_offset);
@@ -1014,12 +1292,26 @@ hss_listen (hss_listener_t *l, session_handle_t *lh)
 static void
 hss_url_handlers_init (hss_main_t *hsm)
 {
-  if (hsm->get_url_handlers)
-    return;
+  static u8 builtin_handlers_initialized;
 
-  hsm->get_url_handlers = hash_create_string (0, sizeof (uword));
-  hsm->post_url_handlers = hash_create_string (0, sizeof (uword));
-  hss_builtinurl_json_handlers_init ();
+  /*
+   * Handlers may have been registered by another plugin before this runs,
+   * so create the tables lazily instead of bailing out.
+   */
+  if (hsm->get_url_handlers == 0)
+    hsm->get_url_handlers = hash_create_string (0, sizeof (uword));
+  if (hsm->post_url_handlers == 0)
+    hsm->post_url_handlers = hash_create_string (0, sizeof (uword));
+  if (hsm->get_url_prefix_handlers == 0)
+    hsm->get_url_prefix_handlers = hash_create_string (0, sizeof (uword));
+  if (hsm->post_url_prefix_handlers == 0)
+    hsm->post_url_prefix_handlers = hash_create_string (0, sizeof (uword));
+
+  if (!builtin_handlers_initialized)
+    {
+      builtin_handlers_initialized = 1;
+      hss_builtinurl_json_handlers_init ();
+    }
 }
 
 int
@@ -1604,6 +1896,25 @@ hss_show_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
  * @cliend
  * @cliexcmd{show http static server sessions cache [verbose [nn]]}
 ?*/
+static clib_error_t *
+hss_show_handlers_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			      vlib_cli_command_t *cmd)
+{
+  hss_main_t *hsm = &hss_main;
+
+  vlib_cli_output (vm, "GET handlers:\n%U", format_hash, hsm->get_url_handlers,
+		   1);
+  vlib_cli_output (vm, "GET prefix handlers:\n%U",
+		   format_hash, hsm->get_url_prefix_handlers, 1);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (hss_show_handlers_command, static) = {
+  .path = "show http static handlers",
+  .short_help = "show http static handlers",
+  .function = hss_show_handlers_command_fn,
+};
+
 VLIB_CLI_COMMAND (hss_show_command, static) = {
   .path = "show http static server",
   .short_help = "show http static server [sessions] [cache] [listeners] "

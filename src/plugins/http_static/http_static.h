@@ -46,6 +46,8 @@ typedef struct hss_session_
   u8 *data;
   /** Data length */
   u64 data_len;
+  /** End offset (exclusive) of the data to send */
+  u64 data_end;
   /** Current data send offset */
   u64 data_offset;
   /** Need to free data in detach_cache_entry */
@@ -56,6 +58,12 @@ typedef struct hss_session_
   http_headers_ctx_t resp_headers;
   /** Response header buffer */
   u8 *headers_buf;
+  /** Parsed request headers */
+  http_header_table_t req_headers;
+  /** Raw request header block */
+  u8 *req_headers_buf;
+  /** Request message, needed to (re)build the header table */
+  http_msg_t req_msg;
   /** RX buffer (POST body) */
   u8 *rx_buff;
   /** Current RX buffer offset */
@@ -83,6 +91,14 @@ typedef struct hss_session_handle_
 STATIC_ASSERT_SIZEOF (hss_session_handle_t, sizeof (u64));
 
 
+typedef struct hss_resp_header_
+{
+  u8 *name;
+  uword name_len;
+  u8 *value;
+  uword value_len;
+} hss_resp_header_t;
+
 typedef struct hss_url_handler_args_
 {
   hss_session_handle_t sh;
@@ -92,6 +108,7 @@ typedef struct hss_url_handler_args_
     /* Request args */
     struct
     {
+      u8 *target_path;
       u8 *query;
       u8 *req_data;
       http_req_method_t req_type;
@@ -105,6 +122,8 @@ typedef struct hss_url_handler_args_
       u8 free_vec_data;
       http_status_code_t sc;
       http_content_type_t ct;
+      /* Vector of hss_resp_header_t, added to the response */
+      hss_resp_header_t *headers;
     };
   };
 } hss_url_handler_args_t;
@@ -185,6 +204,9 @@ typedef struct
   /** Hash tables for built-in GET and POST handlers */
   uword *get_url_handlers;
   uword *post_url_handlers;
+  /** Hash tables for prefix (dynamic path) GET and POST handlers */
+  uword *get_url_prefix_handlers;
+  uword *post_url_prefix_handlers;
 
   /** Application index */
   u32 app_index;
@@ -239,6 +261,9 @@ hss_listener_get (u32 l_index)
  */
 void hss_register_url_handler (hss_url_handler_fn fp, const char *url,
 			       http_req_method_t type);
+void hss_register_url_handler_prefix (hss_url_handler_fn fp,
+				      const char *prefix,
+				      http_req_method_t type);
 void hss_session_send_data (hss_url_handler_args_t *args);
 void hss_builtinurl_json_handlers_init (void);
 hss_session_t *hss_session_get (clib_thread_index_t thread_index,

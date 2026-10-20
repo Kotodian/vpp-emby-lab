@@ -758,6 +758,16 @@ ip route add 0.0.0.0/0 via 184.107.84.254 wan0
 - `num-rx-queues` 必须显式写 `all`（或具体数字）。不写时默认是 0，VPP 会创建 0 个 RX 队列，`show interface` 里 rx 永远为 0。
 - 接口 MTU 必须是 1500。igb 的 XDP 不支持 jumbo，MTU 9000 时 attach 会报 `RX buffer size is too small`，并且触发 af_xdp 失败路径的空指针崩溃。
 
+**7.0 内核复测（2026-10-20）**：已安装 HWE `7.0.0-38-generic`，`xdp-loader features` 返回 `NETDEV_XDP_ACT_XSK_ZEROCOPY: yes`。但 VPP 的 af_xdp 插件仍然 **0 RX**：
+
+- `xdp_dispatcher` + `xsk_def_prog` 以 native 模式挂载；
+- `xsks_map` 有 8 个条目，程序的 `map_ids` 指向同一个 map（66）；
+- `af_xdp-input` 节点在 polling，调用 720 万次，但 `xsk_ring_cons__peek` 始终是 0；
+- 去掉 `XDP_USE_NEED_WAKEUP` 后仍是 0；
+- 同一张网卡上 `af_packet` 正常收包（3 秒 331 包）。
+
+结论：内核侧支持已经就绪，问题在 **VPP af_xdp 插件与 igb/内核 7.0 的 XSK 交互**（UMEM/fill ring/unaligned chunks 方向），需要独立 XSK 工具进一步定位。当前 Phase 2 继续用 `af_packet`。
+
 **为什么当前 6.8 不能用 AF_XDP**：Linux 6.13 及以前的 igb 驱动**完全没有 AF_XDP 代码**（没有 `xsk`、没有 `ndo_xsk_wakeup`），6.14 才加入（含 zero-copy）。6.8 上 XDP 程序能挂成 native，但 XSK redirect 不工作：VPP rx=0，内核也收不到包，WAN 直接断。已实测排除队列数（8/1 队列）和 memlock（4GB）因素。
 
 **SSH punt**：af_packet 下内核仍能收包，SSH 不受影响；切到 AF_XDP 后必须按第 6 节配 `vpp-punt` + `set punt tcp all` + `ip punt redirect`，否则 SSH 直接断。

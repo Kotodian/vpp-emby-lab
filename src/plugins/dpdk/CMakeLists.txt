@@ -20,7 +20,16 @@ if(VPP_USE_SYSTEM_DPDK)
     pkg_check_modules(DPDK REQUIRED libdpdk)
     message(WARNING "-- linking dpdk plugin against system libdpdk, version ${DPDK_VERSION}")
     set(DPDK_LINK_FLAGS ${DPDK_LDFLAGS})
+    link_directories (${DPDK_LIBRARY_DIRS})
     include_directories (${DPDK_INCLUDE_DIRS})
+    # DPDK driver-internal headers are not part of the installed include
+    # tree; point at the DPDK source tree when using a system build.
+    if(DPDK_SRC_DIR)
+      include_directories (
+        ${DPDK_SRC_DIR}/lib/eal/include
+        ${DPDK_SRC_DIR}/drivers/bus/pci
+        ${DPDK_SRC_DIR}/drivers/bus/vmbus)
+    endif()
 else()
     ##############################################################################
     # Find lib and include files

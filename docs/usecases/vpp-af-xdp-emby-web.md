@@ -439,7 +439,7 @@ statseg {
 
 cpu {
   main-core 1
-  corelist-workers 2
+  corelist-workers 2-3
   # 可选，只有在 CPU 隔离/实时调度准备好时再开：
   # scheduler-policy fifo
   # scheduler-priority 1
@@ -460,9 +460,8 @@ buffers {
 
 session {
   enable
-  preallocated-sessions 64
-  v4-session-table-buckets 64
-  v4-halfopen-table-buckets 64
+  v4-session-table-buckets 1024
+  v4-halfopen-table-buckets 1024
   wrk-mq-length 4096
 }
 
@@ -471,6 +470,7 @@ tcp {
   rack
   byte-tracker
   mtu 1500
+  tso
 }
 
 plugins {
@@ -484,8 +484,8 @@ plugins {
 
 要点：
 
-- `main-core 1` + `corelist-workers 2`：**一个 main + 一个 worker**，都在 NUMA 0（与 `enp2s0f0` 同 NUMA）；避开 CPU 0 给内核/中断。
-- 当前版本没有 `session evt-threads` 配置项；session 事件处理跟随 VPP worker，单 worker 就只有一个处理线程。`preallocated-sessions`/table buckets 先给小值，后续按连接数调。
+- `main-core 1` + `corelist-workers 2-3`：main 在 CPU 1，两个 worker 在 CPU 2/3，都在 NUMA 0；避开 CPU 0 给内核/中断。DPDK 侧用 `num-rx-queues 2` 并启用 RSS 才能把流量分到两个 worker。
+- 当前版本没有 `session evt-threads` 配置项；session 事件处理跟随 VPP worker。不要设置 `preallocated-sessions`：它会把 worker session pool 固定为该上限；不设置时 pool 会通过 `pool_program_safe_realloc_rpc` 动态扩展。
 - `memory main-heap-size 2G` 需要至少 2G 大页；`vm.nr_hugepages=2048`（2M × 2048 = 4G）足够 main heap + buffers。
 - `api-segment prefix vpp-lab` 和独立的 `cli/api/stats` socket 让 lab 实例与其它 VPP 隔离。
 - `tcp { cc-algo bbr rack byte-tracker }` 只对新连接生效；`rack` 启用 RACK/TLP，3-dup-ack 不再是恢复触发条件。
@@ -1096,7 +1096,7 @@ sysctl -w vm.nr_hugepages=2048
 
 ### 5.3 startup.conf 草案
 
-Phase 1/2 的完整配置见 3.1：**一个 main + 一个 worker**（`main-core 1`、`corelist-workers 2`）、独立 API/stat/runtime、2G main heap、32768 buffers、session 预分配参数、`tcp cc-algo bbr rack byte-tracker`。Phase 3 只把 dataplane 插件换成 AF_XDP：
+Phase 1/2 的完整配置见 3.1：**一个 main + 两个 worker**（`main-core 1`、`corelist-workers 2-3`）、独立 API/stat/runtime、256M main heap、32768 buffers、动态 session pool、`tcp cc-algo bbr rack byte-tracker tso`。Phase 3 只把 dataplane 插件换成 AF_XDP：
 
 ```text
 plugins {
@@ -1106,7 +1106,7 @@ plugins {
 }
 ```
 
-`enp2s0f0` 和 CPU 1/2 都在 NUMA 0；单 worker 足够这次功能验证，不要先上多 worker。
+`enp2s0f0` 和 CPU 1/2/3 都在 NUMA 0。功能验证用双 worker；VCL app 本身仍可能是单线程，连接数上限和聚合吞吐要分开评估。
 
 ### 5.4 vppctl 配置草案
 
@@ -1302,7 +1302,6 @@ ss -ti | grep -E 'bbr|rack|tlp' | head
 
 ```text
 session {
-  preallocated-sessions 64
 }
 
 tcp {
@@ -2073,4 +2072,92 @@ tcpdump -ni tun-punt tcp port 22   # 只有 SSH punt
 2. **P1**：媒体路径 + Range/206 + HLS 静态分片；验证 seek 和播放。
 3. **P2**：scanner/ffmpeg + 索引 + 鉴权 + TLS + 限流。
 4. **P3**：可选的 Emby API 子集；在此之前不要声称兼容 Emby 客户端。
+
+## 13. 2026-10-22 最终验证配置
+
+本节记录当前实际跑通的环境，优先于前面的早期草案。
+
+### 13.1 f0 DPDK + 双 worker
+
+```text
+cpu { main-core 1 corelist-workers 2-3 }
+
+session {
+  enable
+  v4-session-table-buckets 1024
+  v4-halfopen-table-buckets 1024
+  wrk-mq-length 4096
+}
+
+tcp { cc-algo bbr rack byte-tracker mtu 1500 tso }
+
+dpdk {
+  enable-tcp-udp-checksum
+  dev 0000:02:00.0 {
+    num-rx-queues 2
+    num-rx-desc 2048
+    num-tx-desc 4096
+    tso on
+  }
+}
+```
+
+关键点：
+
+- 不要设置 `preallocated-sessions`。该参数会调用 `pool_init_fixed()`，把 worker session pool 固定成硬上限；不设置时 pool 通过 `pool_program_safe_realloc_rpc` 动态扩展。
+- `num-rx-queues 2` 同时启用 RSS；否则第二个 worker 没有 RX 队列。
+- `enable-tcp-udp-checksum` 必须显式开启，否则 DPDK 日志会报 `TCP/UDP checksum offload must be enabled`，即使 `tso on` 也不会把 `tcp-tso` 置为 active。
+- 当前 `show hardware-interfaces` 的 TX active 包含 `tcp-tso`；tap `punt0` 的 `gso-enabled/csum-enabled/packet-coalesce` 为 1。
+- i350 的 DPDK RX 没有 `tcp-lro/gro` capability；WAN 侧无法开 GRO，只能开 TSO 和 tap 侧 GSO/coalesce。
+
+### 13.2 VCL 与连接规模
+
+VCL 每个 session 的 fifo 当前为 4MB：
+
+```text
+vcl {
+  rx-fifo-size 4000000
+  tx-fifo-size 4000000
+  api-socket-name /run/vpp-dpdk/api.sock
+  app-socket-api /run/vpp-dpdk/app_ns_sockets/default
+  use-mq-eventfd
+}
+```
+
+实测结论：
+
+- 200 条并发小请求（每条 64KB Range）全部成功，session pool 动态扩展到 500+ 条会话，没有 fixed-size pool OOM。
+- 200 条并发 8MB 长流仍未全部完成。失败不是 session 数量上限，而是单 nginx/VCL app worker 的聚合吞吐/接收 fifo 压力；日志会出现 `tcp4-established Packets dropped for lack of rx fifo`。
+- 尝试 nginx `worker_processes 2` + `reuseport` 失败：VCL 不支持多个 nginx worker 绑定同一 `IP:port`，会报 `ip port pair already listened on`。因此要支撑 200 条满速长流，需要多个前端实例 + L4 负载均衡，或把 TLS/HTTP 终止做进 VPP app；仅加 VPP worker 不够。
+
+### 13.3 Emby API DNAT 与 SSH punt
+
+VPP 接管 f0 后，Emby API 上游必须保留 `vpp-punt` DNAT：
+
+```bash
+sysctl -w net.ipv4.conf.vpp-punt.route_localnet=1
+iptables -t nat -A PREROUTING -i vpp-punt -p tcp -d 10.30.0.2 --dport 8096 \
+  -j DNAT --to-destination 127.0.0.1:8096
+```
+
+该规则已固化到 `/usr/local/sbin/vpp-f0-start.sh` 调用的 `vpp-emby-dnat.sh`。漏掉时表现为 Emby `/System/Info/Public` 502，但 media 8080 仍正常。
+
+SSH 走 `set punt tcp all` + `ip punt redirect` 到 `vpp-punt`。**重启 VPP 必然断开 SSH**，因为 punt TAP 和主机路由会消失；生产环境应通过 `enp2s0f1` 独立管理口、IPMI 或串口操作，不能只依赖 f0 上的 SSH。
+
+### 13.4 heap 生命周期与 show memory
+
+`show memory` 的 SIGSEGV 根因不是并发锁：
+
+- CLI 命令默认不是 mp-safe，vlib 已自动持有 worker barrier。
+- `svm` / `ssvm` / private API segment 在 `munmap` 前没有调用已有的 `clib_mem_destroy_heap()`，导致已 unmap 的 heap 指针留在 `clib_mem_main.heaps`。
+- 修复方式是生产者路径在 unmap 前注销 heap，不新增全局锁、不新增 `__clib_export`、不改 `show memory` 的生命周期语义。
+
+### 13.5 验证基线
+
+- `codex` 登录 Emby：HTTP 200
+- `/emby/System/Info/Public`：HTTP 200
+- `/emby/videos/21082/original.mp4` Range：HTTP 206
+- VPP、VCL nginx、watchdog 同时运行
+- WAN `https://api.deepseek.com`：401
+- hugepages：`vm.nr_hugepages=1024`，持久化到 `/etc/sysctl.d/99-vpp-hugepages.conf`
 

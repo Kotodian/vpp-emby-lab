@@ -1006,6 +1006,15 @@ svm_region_unlink (svm_region_t * rp)
  * The root region mutex guarantees atomicity with respect to
  * a new region client showing up at the wrong moment.
  */
+static void
+svm_region_unmap_heaps (svm_region_t *rp)
+{
+  if (rp->region_heap)
+    clib_mem_destroy_heap (rp->region_heap);
+  if (rp->data_heap)
+    clib_mem_destroy_heap (rp->data_heap);
+}
+
 void
 svm_region_unmap_internal (void *rp_arg, u8 is_client)
 {
@@ -1114,6 +1123,7 @@ found:
       if (!is_client)
 	svm_region_unlink (rp);
 
+      svm_region_unmap_heaps (rp);
       munmap ((void *) virtual_base, virtual_size);
       region_unlock (root_rp);
       svm_pop_heap (oldheap);
@@ -1145,7 +1155,7 @@ static void
 svm_region_exit_internal (u8 is_client)
 {
   void *oldheap;
-  int i, mypid = getpid ();
+  int i, last_client = 0, mypid = getpid ();
   uword virtual_base, virtual_size;
 
   /* It felt so nice we did it twice... */
@@ -1183,12 +1193,15 @@ svm_region_exit_internal (u8 is_client)
 
 found:
 
+  last_client = vec_len (root_rp->client_pids) == 0;
   if (!is_client && vec_len (root_rp->client_pids) == 0)
     svm_region_unlink (root_rp);
 
   region_unlock (root_rp);
   svm_pop_heap (oldheap);
 
+  if (last_client)
+    svm_region_unmap_heaps (root_rp);
   root_rp = 0;
   munmap ((void *) virtual_base, virtual_size);
 }

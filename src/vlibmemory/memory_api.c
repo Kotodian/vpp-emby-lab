@@ -28,6 +28,15 @@
 volatile int **vl_api_queue_cursizes;
 
 static void
+vl_mem_destroy_region_heaps (svm_region_t *rp)
+{
+  if (rp->region_heap)
+    clib_mem_destroy_heap (rp->region_heap);
+  if (rp->data_heap)
+    clib_mem_destroy_heap (rp->data_heap);
+}
+
+static void
 memclnt_queue_callback (vlib_main_t * vm)
 {
   int i;
@@ -384,6 +393,7 @@ vl_api_memclnt_delete_t_handler (vl_api_memclnt_delete_t * mp)
 
 	      vec_delete (am->vlib_private_rps, 1, i);
 	      /* Kill it, accounting for the memfd header page */
+	      vl_mem_destroy_region_heaps (am->vlib_rp);
 	      if (munmap ((void *) virtual_base, virtual_size) < 0)
 		clib_unix_warning ("munmap");
 	      /* Reset the queue-length-address cache */
@@ -715,6 +725,7 @@ vl_mem_api_dead_client_scan (api_main_t * am, vl_shmem_hdr_t * shm, f64 now)
 		found:
 		  /* Kill it, accounting for the memfd header page */
 		  svm_pop_heap (oldheap);
+		  vl_mem_destroy_region_heaps (dead_rp);
 		  if (munmap ((void *) virtual_base, virtual_size) < 0)
 		    clib_unix_warning ("munmap");
 		  /* Reset the queue-length-address cache */

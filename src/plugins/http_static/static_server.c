@@ -4,6 +4,7 @@
  */
 
 #include <http_static/http_static.h>
+#include <sys/mman.h>
 #include <vnet/session/application.h>
 
 #include <sys/types.h>
@@ -327,12 +328,29 @@ hss_session_send_data (hss_url_handler_args_t *args)
 
   if (hs->data && hs->free_data)
     vec_free (hs->data);
+  if (hs->data_mmap)
+    {
+      munmap (hs->data_mmap, hs->data_mmap_len);
+      hs->data_mmap = 0;
+      hs->data_mmap_len = 0;
+    }
 
-  hs->data = args->data;
-  hs->data_len = args->data_len;
+  if (args->data_mmap)
+    {
+      hs->data = args->data_mmap;
+      hs->data_len = args->data_mmap_len;
+      hs->free_data = 0;
+      hs->data_mmap = args->data_mmap;
+      hs->data_mmap_len = args->data_mmap_len;
+    }
+  else
+    {
+      hs->data = args->data;
+      hs->data_len = args->data_len;
+      hs->free_data = args->free_vec_data;
+    }
   hs->data_offset = 0;
-  hs->data_end = args->data_len;
-  hs->free_data = args->free_vec_data;
+  hs->data_end = hs->data_len;
 
   /*
    * Range is transport semantics: apply it to any successful response,
@@ -911,6 +929,12 @@ hss_ts_rx_callback (session_t *ts)
 
   if (hs->free_data)
     vec_free (hs->data);
+  if (hs->data_mmap)
+    {
+      munmap (hs->data_mmap, hs->data_mmap_len);
+      hs->data_mmap = 0;
+      hs->data_mmap_len = 0;
+    }
 
   hs->data = 0;
   hs->data_len = 0;
@@ -1161,6 +1185,12 @@ hss_ts_cleanup (session_t *s, session_cleanup_ntf_t ntf)
 
   if (hs->free_data)
     vec_free (hs->data);
+  if (hs->data_mmap)
+    {
+      munmap (hs->data_mmap, hs->data_mmap_len);
+      hs->data_mmap = 0;
+      hs->data_mmap_len = 0;
+    }
   hs->data = 0;
   hs->data_offset = 0;
   hs->free_data = 0;

@@ -52,6 +52,9 @@ typedef struct hss_session_
   u64 data_offset;
   /** Need to free data in detach_cache_entry */
   int free_data;
+  /** mmap'd response body owned by the transport */
+  void *data_mmap;
+  u64 data_mmap_len;
   /** File cache pool index */
   u32 cache_pool_index;
   /** Response header ctx */
@@ -120,6 +123,9 @@ typedef struct hss_url_handler_args_
       u8 *data;
       uword data_len;
       u8 free_vec_data;
+      /* Optional mmap'd body; takes precedence over data */
+      void *data_mmap;
+      size_t data_mmap_len;
       http_status_code_t sc;
       http_content_type_t ct;
       /* Vector of hss_resp_header_t, added to the response */

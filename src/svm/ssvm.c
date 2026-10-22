@@ -5,6 +5,7 @@
 
 #include <svm/ssvm.h>
 #include <svm/svm_common.h>
+#include <vppinfra/mem.h>
 
 typedef int (*init_fn) (ssvm_private_t *);
 typedef void (*delete_fn) (ssvm_private_t *);
@@ -196,6 +197,9 @@ ssvm_delete_shm (ssvm_private_t * ssvm)
   vec_free (fn);
   vec_free (ssvm->name);
 
+  if (ssvm->is_server && ssvm->sh && ssvm->sh->heap)
+    clib_mem_destroy_heap (ssvm->sh->heap);
+
   if (ssvm->is_server)
     clib_mem_vm_unmap (ssvm->sh);
   else
@@ -343,6 +347,8 @@ void
 ssvm_delete_memfd (ssvm_private_t * memfd)
 {
   vec_free (memfd->name);
+  if (memfd->is_server && memfd->sh && memfd->sh->heap)
+    clib_mem_destroy_heap (memfd->sh->heap);
   if (memfd->is_server)
     clib_mem_vm_unmap (memfd->sh);
   else

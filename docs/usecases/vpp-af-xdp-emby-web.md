@@ -2127,8 +2127,18 @@ vcl {
 实测结论：
 
 - 200 条并发小请求（每条 64KB Range）全部成功，session pool 动态扩展到 500+ 条会话，没有 fixed-size pool OOM。
-- 200 条并发 8MB 长流仍未全部完成。失败不是 session 数量上限，而是单 nginx/VCL app worker 的聚合吞吐/接收 fifo 压力；日志会出现 `tcp4-established Packets dropped for lack of rx fifo`。
-- 尝试 nginx `worker_processes 2` + `reuseport` 失败：VCL 不支持多个 nginx worker 绑定同一 `IP:port`，会报 `ip port pair already listened on`。因此要支撑 200 条满速长流，需要多个前端实例 + L4 负载均衡，或把 TLS/HTTP 终止做进 VPP app；仅加 VPP worker 不够。
+- 200 条并发 8MB 长流仍未全部完成（实测约 140 条超时）。失败不是 session 数量上限，而是单 VCL app worker 的聚合吞吐/接收 fifo 压力；日志会出现 `tcp4-established Packets dropped for lack of rx fifo`。
+- nginx 可以 master + 2 workers，但**不能加 `reuseport`**：那会让每个 worker 各自向 VCL bind，报 `ip port pair already listened on`。正确做法是 `master_process on; worker_processes 2;`，listen 不带 `reuseport`，由 master 建一个 VCL listener、worker 继承：
+
+```text
+master_process on;
+worker_processes 2;
+worker_rlimit_nofile 65535;
+events { worker_connections 4096; use epoll; }
+listen 184.107.84.201:443 ssl http2;
+```
+
+- 即使 nginx 有两个 worker，VCL app session 仍主要落在一个 VPP worker（`show session` 可见 Thread 1 几百条、Thread 2 只有极少），所以 200 条满速长流仍受单 VCL app worker 限制。要真正扩展长流，需要多个 VCL app worker/进程使用不同 app namespace + 独立 listener，再做 L4 负载均衡；或者把 TLS/HTTP 终止做进 VPP app。仅加 nginx worker 或 VPP worker 都不够。
 
 ### 13.3 Emby API DNAT 与 SSH punt
 

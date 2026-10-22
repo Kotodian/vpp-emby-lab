@@ -2112,12 +2112,12 @@ dpdk {
 
 ### 13.2 VCL 与连接规模
 
-VCL 每个 session 的 fifo 当前为 4MB：
+VCL 每个 session 的 fifo 当前为 8MB。4MB 和 8MB 都实测过，单条长流没有可见提升；继续加到 16MB 会显著增加 200 连接时的 app segment 压力，不建议无脑加大：
 
 ```text
 vcl {
-  rx-fifo-size 4000000
-  tx-fifo-size 4000000
+  rx-fifo-size 8000000
+  tx-fifo-size 8000000
   api-socket-name /run/vpp-dpdk/api.sock
   app-socket-api /run/vpp-dpdk/app_ns_sockets/default
   use-mq-eventfd
@@ -2171,4 +2171,261 @@ SSH 走 `set punt tcp all` + `ip punt redirect` 到 `vpp-punt`。**重启 VPP �
 - VPP、VCL nginx、watchdog 同时运行
 - WAN `https://api.deepseek.com`：401
 - hugepages：`vm.nr_hugepages=1024`，持久化到 `/etc/sysctl.d/99-vpp-hugepages.conf`
+
+## 14. 多用户生产架构与 CDN
+
+### 14.1 结论：控制面与数据面拆开
+
+当前 `客户端 -> VPP host stack -> VCL nginx -> VPP media plugin` 拓扑适合验证“播放字节确实走 VPP、Range/206 正确、SSH punt 可用”，但不适合直接作为多用户公网入口。原因是数据面被收窄成一个 VCL nginx app worker，TLS、HTTP、文件读取和大规模并发全部压在同一个 VPP app worker 上；继续调 fifo、增 nginx worker 或加 VPP worker，都不能改变这个串行点。
+
+生产建议把职责拆开：
+
+- **控制面**：Emby 用 systemd 运行，只负责登录、鉴权、元数据、`PlaybackInfo`、进度同步和转码决策。
+- **数据面**：direct play 的文件字节不再经过 Emby。由独立 edge 服务读取本地盘/NFS/对象存储，使用内核 `sendfile`、`aio` 或多进程/多线程文件服务发送。
+- **VPP 定位**：负责 WAN 的 L3/L4、NAT、SSH punt、ACL、限速和故障切换；如果必须由 VPP 终止 TCP，则需要单独的 host-stack 扩展设计，不能沿用当前单 VCL nginx 作为唯一 TLS 前端。
+- **CDN**：只缓存可缓存的媒体对象和 HLS 分片，不缓存 Emby 登录、鉴权、用户信息和动态 API。
+
+当前 lab 的 Emby 仍是 Docker 容器 `av-emby`，这是验证环境；生产基线是 systemd Emby。两者不要混写，也不要求在验证阶段先迁移 Docker。
+
+### 14.2 推荐拓扑
+
+```text
+客户端
+  │ HTTPS + Range
+  ▼
+DNS / GeoDNS / CDN
+  │ 签名 URL、Range/206、缓存
+  ▼
+L4 LB / HAProxy（多 edge 时）
+  │
+  ├── edge-1: 内核 nginx 多 worker ──┐
+  ├── edge-2: 内核 nginx 多 worker ──┤
+  └── edge-N: 内核 nginx 多 worker ──┤
+                                      ▼
+                     本地 NVMe / NFS / MinIO / S3
+
+Emby（systemd）
+  ├── /emby/*        登录、元数据、PlaybackInfo、进度
+  ├── /Items/*       媒体库浏览
+  └── 转码 worker    需要转码时输出 HLS
+```
+
+URL 按职责分开，避免把动态 API 和可缓存媒体混在同一个 location：
+
+```text
+/emby/*        -> Emby 控制面，默认 no-store，不进入 CDN 缓存
+/media/*       -> edge 文件服务，支持 Range/206，可缓存
+/hls/*/*.m3u8  -> 播放列表，短 TTL 或 no-cache
+/hls/*/*.ts    -> HLS 分片，内容寻址后可长期缓存
+```
+
+单机也可以落地，但不要把“公网 TLS 终止”继续放在 VCL nginx 里：
+
+- **单机、优先稳定**：VPP 继续接管 `enp2s0f0`，把 443 和 SSH 一起 punt 给内核；内核 nginx 多 worker 负责 TLS 和文件发送。VPP 仍做 NAT、ACL 和链路切换，但 HTTP 不再经过 VPP host stack。
+- **单机、坚持 VPP 终止 TCP**：需要把 external app 拆成多个可独立调度的实例，并解决 VCL listener 与 app worker 的分配问题；这是独立的 host-stack 工程，不是当前 lab 的配置调整。
+- **多机、VPP 必须接管 WAN**：VPP 作为边缘路由器，把流量转发到独立 edge 主机；edge 主机用内核 nginx 多 worker。不要把文件和 TLS 再塞回 VPP 单 app worker。
+
+### 14.3 鉴权与 `itemId -> path` 索引
+
+direct play 的关键不是让 nginx 直接暴露文件路径，而是建立一个受控的媒体索引：
+
+1. 客户端先通过 Emby 完成登录，拿到 Emby 用户身份。
+2. 控制面调用 Emby API 获取 `PlaybackInfo`，确认该用户能播放哪个 `itemId`、是否需要转码。
+3. 控制面签发短 TTL 的播放 token，内容至少包含 `userId`、`itemId`、`exp`、`deviceId`，用 HMAC 签名；不要把永久 Emby API key 放进 URL。
+4. edge 在本地校验 token，不要求每个 Range 请求都回源 Emby。
+5. edge 用 `itemId` 查询索引，得到不可猜测的媒体 ID 或对象 key，再映射到真实文件；真实文件系统路径不返回给客户端。
+6. nginx 通过 `X-Accel-Redirect` 进入 internal location 发送文件，或由 Go/Rust 文件服务直接 `sendfile`。
+
+索引可以由 `src/scripts/emby-index.py` 先做全量 bootstrap，生产再增加增量同步：媒体库扫描完成、文件替换、条目删除时更新 `itemId -> object key -> size/mtime/etag`。索引只保存元数据和对象 key，不把大文件塞进数据库。
+
+如果暂时不做独立控制面，也可以让 nginx `auth_request` 调 Emby 校验；但要加本地 token 缓存，否则每个 Range 请求都会打 Emby，无法支撑多用户拖动进度。
+
+### 14.4 容量计算：先算出口带宽，再谈 VPP
+
+链路带宽和 TCP 在途数据量必须先分开算：
+
+```text
+1 Gbps = 125 MB/s（理想值，实际可用按 110-115 MB/s 估算）
+BDP(Bytes) = 带宽(B/s) × RTT(s)
+```
+
+1 Gbps 链路的 BDP 参考：
+
+| RTT | BDP | 单流接收窗口建议 |
+|---:|---:|---:|
+| 20 ms | 2.5 MB | 4-8 MB |
+| 69 ms | 8.6 MB | 16-32 MB |
+| 150 ms | 18.75 MB | 32 MB 或更高 |
+
+这里的窗口是**单条长流**所需，不是每用户固定分配。100 条同时跑满的长流不能简单乘以 32MB；真正能同时跑满的流数由出口带宽决定。客户端 `rmem` 太小会把单流吞吐限制在 `窗口 / RTT`，这与 VPP session 数无关；此前 144 客户端提高接收 buffer 后单流跑满，已经验证了这一点。
+
+并发用户数按码率和余量估算：
+
+```text
+N ≈ 可用带宽(Mbps) × 0.7 / 单用户码率(Mbps)
+```
+
+1 Gbps 出口的粗略上限：
+
+| 内容 | 单用户码率 | 70% 带宽下的理论并发 |
+|---|---:|---:|
+| 1080p direct play | 8 Mbps | 约 87 |
+| 1080p 高码率 | 20 Mbps | 约 35 |
+| 4K | 40 Mbps | 约 17 |
+| 4K 高码率/HDR | 80 Mbps | 约 8 |
+
+这些数字是链路上限，不是 Emby 或 VPP 的处理上限。实际还要扣掉：
+
+- 重传、协议开销和突发流量，按 20%-30% 余量预留。
+- 转码输出通常比源文件更高码率；转码和 direct play 不能共用同一份带宽预算。
+- 多用户同时拖动会产生 Range 请求和短时突发，CDN/edge 要有缓存和限速。
+- 机械盘随机读在多条 4K 流下会先于网络成为瓶颈；热门内容放 NVMe 或对象存储。
+- Emby 的扫描、刮削、转码和 API 不应与文件发送争同一批 CPU/IO。
+
+### 14.5 VPP 在当前架构中的边界
+
+| 方案 | 数据路径 | 适用场景 | 主要问题 |
+|---|---|---|---|
+| 当前 VCL nginx + VPP media app | 公网 -> VPP session -> VCL nginx -> VPP internal app | 单用户/少量用户验证、协议和 Range 验证 | TLS、HTTP、文件发送集中在一个 app worker；不适合多用户公网入口 |
+| VPP L3/L4 + 443/SSH punt 到内核 nginx | 公网 -> VPP NAT/punt -> 内核 nginx 多 worker -> 本地盘 | 单机、1 Gbps、优先稳定 | HTTP 不走 VPP host stack，但内核 nginx 很容易跑满 1 Gbps |
+| VPP 边缘路由器 + 独立 edge 主机 | 公网 -> VPP -> LAN -> edge nginx -> 存储 | 多机、需要 VPP 接管 WAN | 需要独立 LAN/管理网络和 edge 运维 |
+| 内核 nginx 直接暴露 | 公网 -> 内核 nginx -> 存储 | 回滚、对照基线 | 放弃 VPP 数据面能力 |
+
+如果目标只是“让客户端 TCP 走 VPP”，当前 lab 已经证明可行；如果目标是“多用户稳定看片”，应优先选择后两种，把 VPP 留在它擅长的 L3/L4 和 punt 路径上。不要在数据面里增加 `clib_warning`，也不要用固定 `preallocated-sessions` 掩盖容量问题。
+
+生产机的 SSH 不能只依赖被 VPP 接管的 `enp2s0f0`。应使用独立的 `enp2s0f1` 管理地址、IPMI 或串口；VPP 重启时 punt TAP 和主机路由会消失，f0 上的 SSH 必然断，watchdog 只能负责恢复，不能保证会话不断。
+
+### 14.6 CDN 设计
+
+#### 14.6.1 direct play 与 HLS 分开
+
+- **direct play**：通常是完整 MP4/MKV，支持 `Range` 和 `206`。对象不变时最适合 CDN 缓存整对象，再由 CDN 从完整对象切片响应 Range。
+- **HLS**：`m3u8` 是短生命周期索引，`.ts`/`.m4s` 分片才是大流量。点播分片应内容寻址并长期缓存；直播或按会话转码的播放列表不能当公共静态文件缓存。
+
+不要把 `/emby/Items/*`、登录接口、播放进度接口放进 CDN 缓存。它们可能包含用户身份和动态状态。
+
+#### 14.6.2 签名 URL 与缓存 key
+
+推荐使用短 TTL 的签名 URL 或签名 Cookie：
+
+```text
+https://cdn.example.com/media/<content-id>/<file>?exp=...&sig=...
+```
+
+要求：
+
+- token TTL 建议 5-15 分钟；长时间播放由客户端按需续签，不签发永久 URL。
+- 签名覆盖路径、过期时间、必要时覆盖用户/设备；不要把 Emby API key、用户密码、真实文件路径放进 URL。
+- **CDN 缓存 key 必须去掉 `exp`/`sig` 等签名参数**；否则每个用户、每次刷新都是新对象，命中率会接近零。
+- 如果 CDN 支持，优先把签名放在 Cookie 或请求头，路径作为稳定缓存 key；若只能用 query，配置 CDN 在 cache key 中忽略签名字段，但校验仍要在回源前完成。
+- 不要把 `Authorization`、Cookie、`X-Emby-Token` 放进缓存 key；这既会碎片化缓存，也可能造成越权命中。
+
+#### 14.6.3 缓存头和 Range
+
+direct play 的源站至少返回：
+
+```text
+Accept-Ranges: bytes
+ETag: "<strong-etag>"
+Last-Modified: <http-date>
+Cache-Control: public, max-age=31536000, immutable   # 内容寻址、永不覆盖时
+```
+
+如果同一个 URL 会被替换，不能使用一年 `immutable`；应使用较短 TTL，并在替换时主动 purge。更稳妥的做法是把内容哈希放进路径，替换文件就生成新 URL，旧 URL 自然淘汰。
+
+Range 的关键是避免缓存 key 被 `Range` 打散：
+
+- 让 CDN 缓存完整对象，`206` 从完整对象切片；不要按每个 `Range` 生成独立缓存对象。
+- 源站必须正确实现 `206`、`Content-Range` 和边界 `416`；否则播放器拖动进度会失败。
+- 大文件如果 CDN 只支持分片缓存，要确认分片能被合并和复用，并监控 `206` 命中率与回源字节数。
+- 禁止在媒体响应里下发 `Set-Cookie`；不要设置 `Vary: Range` 或 `Vary: Cookie`。
+
+#### 14.6.4 HLS 缓存策略
+
+| 对象 | 建议 |
+|---|---|
+| 点播 `m3u8` | `max-age=5-60`，内容变化时 purge；或使用版本化路径 |
+| 直播/会话 `m3u8` | `no-cache` 或极短 TTL，不共享缓存 |
+| `.ts`/`.m4s` 分片 | 内容寻址后 `public, max-age=31536000, immutable` |
+| 加密密钥 | 绝不公共缓存；短 TTL、鉴权、独立 origin |
+
+按会话转码的 HLS 分片不能直接放进公共 CDN；要么先打包成共享 VOD 分片，要么给每个会话独立 token 和隔离缓存命名空间。
+
+#### 14.6.5 Origin shield、回源和多 edge
+
+- 每个区域设置一层 origin shield，回源请求先收敛到 shield，避免每个 edge 都回源。
+- nginx 开启 `proxy_cache_lock`，合并同一对象的并发回源；配置 `proxy_cache_use_stale error timeout updating`，源站抖动时用旧对象兜底。
+- 只允许 CDN 回源地址访问 origin，使用 mTLS、HMAC 或 IP allowlist；不要因为 CDN 在前面就取消源站鉴权。
+- 多 edge 用 DNS/GeoDNS 或 L4 LB 分流，健康检查覆盖 TLS、媒体 Range 和 API 两条路径。
+- API 和文件服务分开做健康检查：文件 edge 挂了不应把 Emby API 一起判死，反之亦然。
+
+#### 14.6.6 失效与一致性
+
+- 内容寻址路径（`/media/<hash>/...`）不需要逐条 purge，替换文件生成新 hash 即可。
+- 固定 URL 必须在文件替换后 purge，并保证索引、CDN 缓存和 Emby 元数据按同一顺序更新；不要先更新索引再让客户端读到旧缓存。
+- HLS 播放列表更新要和分片上传完成绑定；分片未就绪时不能提前发布新 `m3u8`。
+- 预留 `stale-if-error` 和回源熔断，避免源站故障时 CDN 把错误页缓存成媒体对象。
+
+#### 14.6.7 安全与限流
+
+- 防盗链用签名 URL/Cookie，不依赖可伪造的 `Referer`。
+- 每用户限制并发流数、总带宽和单 IP 连接数；转码任务单独限流，避免一个用户占满 CPU。
+- token 可绑定用户和设备；绑定 IP 会影响移动网络切换，按业务决定，不要默认强绑。
+- 日志脱敏：不记录完整签名、Emby token、Cookie 和真实文件路径。
+- 媒体响应不要回显内部路径、堆栈或 Emby 版本信息；错误页统一。
+- 对 `/emby/*` 开 WAF/速率限制，对 `/media/*` 重点防批量扫描和盗链。
+
+#### 14.6.8 观测指标
+
+至少采集：
+
+- CDN/edge 的字节命中率、请求命中率、回源字节数和回源 QPS。
+- `206` 比例、Range 请求分布、`416` 数量、TTFB p50/p95/p99。
+- 每用户并发流、每用户码率、启动时间、卡顿/rebuffer（客户端侧）。
+- 源站出口带宽、磁盘读吞吐/IOPS、NFS 延迟、对象存储 4xx/5xx。
+- token 校验失败、403/410、盗链拦截、单 IP 限流触发次数。
+- 每个 edge 的 TLS 握手失败、连接数、重传和 keepalive 使用情况。
+
+不要只看“平均速度”。多用户场景更重要的是 p95 启动时间、卡顿率和源站出口是否被打满。
+
+### 14.7 分阶段落地
+
+**阶段 A：单 edge，本地盘**
+
+- Emby 迁到 systemd，API 只监听 `127.0.0.1:8096`。
+- edge 用内核 nginx 多 worker，`sendfile on`、`aio threads`，本地 NVMe 存热门媒体。
+- 实现 `itemId -> object key` 索引和短 TTL 签名 URL。
+- 先不做 CDN，验证直连 edge 的 Range、拖动、并发和限速。
+
+**阶段 B：双 edge + L4 LB**
+
+- 两台 edge 共享 NFS/MinIO 或做内容同步，LB 做健康检查和故障摘除。
+- API 与媒体分开路由；媒体请求不要求会话粘滞。
+- 压测从多台外部客户端发起，不用本机 VCL 客户端冒充公网客户端。
+
+**阶段 C：对象存储 + CDN + origin shield**
+
+- 媒体上传到对象存储，路径带内容哈希；CDN 缓存完整对象，Range 从缓存切片。
+- 签名 URL/Cookie 在 CDN 边缘校验，源站只接受 CDN 回源身份。
+- 配置缓存 key 忽略签名参数、`proxy_cache_lock`、stale 兜底和 purge 流程。
+
+**阶段 D：独立转码节点 + HLS/CDN**
+
+- 转码节点用 QSV/NVENC/独显，和 edge 文件服务隔离；E5-2690 v2 纯软件转码很快会成为瓶颈。
+- 需要转码的请求由 Emby 控制面创建任务，输出 HLS；点播分片内容寻址后交给 CDN。
+- 按会话生成的播放列表不共享缓存，避免用户之间串流或越权。
+
+### 14.8 实施清单
+
+- [ ] 把 Emby 从当前 Docker 验证环境迁到 systemd，媒体目录和配置路径先备份。
+- [ ] 保留 Emby API 在 loopback，不让 `.NET` 进程直接发送大文件。
+- [ ] 建立 `itemId -> object key -> size/mtime/etag` 索引，支持增量更新和删除。
+- [ ] 实现播放 token 签发/校验，TTL 5-15 分钟，不暴露 Emby API key。
+- [ ] edge nginx 使用 internal location + `X-Accel-Redirect`，或 Go/Rust 文件服务使用 `sendfile`。
+- [ ] 配置 `Accept-Ranges`、`ETag`、`Last-Modified`、`206/416` 和媒体缓存头。
+- [ ] CDN cache key 去掉签名参数，禁止缓存 `Set-Cookie`、Authorization 和用户 API。
+- [ ] 配置 origin shield、回源鉴权、`proxy_cache_lock`、stale 兜底和 purge。
+- [ ] 加每用户并发/带宽限制、单 IP 限流、日志脱敏和防盗链。
+- [ ] 用多台外部客户端压测；记录 p95 TTFB、命中率、回源字节、卡顿和源站出口。
+- [ ] 最后再决定 VPP 保留在 L3/L4、punt 还是 host-stack 终止；不要用调大 fifo 代替架构拆分。
 

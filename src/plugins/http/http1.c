@@ -236,7 +236,9 @@ http1_parse_target (http_ctx_t *req, u8 *rx_buf)
   for (i = req->target_path_offset;
        i < (req->target_path_offset + req->target_path_len); i++)
     {
-      if ((rx_buf[i] == ':') && (isdigit (rx_buf[i + 1])))
+      if ((rx_buf[i] == ':') &&
+	  (i + 1 < req->target_path_offset + req->target_path_len) &&
+	  (isdigit (rx_buf[i + 1])))
 	{
 	  req->target_authority_len = req->target_path_len;
 	  req->target_path_len = 0;
@@ -1953,7 +1955,12 @@ http1_app_tx_callback (http_ctx_t *hc, u32 req_index, transport_send_params_t *s
 {
   http_ctx_t *req;
 
-  req = http_ctx_get_w_thread (req_index, hc->c_thread_index);
+  req = http_ctx_get_w_thread_if_valid (req_index, hc->c_thread_index);
+  if (req == 0)
+    {
+      HTTP_DBG (1, "request already deleted");
+      return;
+    }
 
   if (!http1_req_state_is_tx_valid (req))
     {
@@ -1985,7 +1992,12 @@ http1_app_rx_evt_callback (http_ctx_t *hc, u32 req_index, clib_thread_index_t th
 {
   http_ctx_t *req;
 
-  req = http_ctx_get_w_thread (req_index, thread_index);
+  req = http_ctx_get_w_thread_if_valid (req_index, thread_index);
+  if (req == 0)
+    {
+      HTTP_DBG (1, "request already deleted");
+      return;
+    }
 
   if (req->req_state == HTTP_REQ_STATE_TUNNEL)
     http1_req_state_tunnel_rx (hc, req, 0);

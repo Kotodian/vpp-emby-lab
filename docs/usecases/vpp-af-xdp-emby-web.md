@@ -2639,7 +2639,7 @@ gdb -q /root/netsystem-rs/third_party/vpp/build-vpp-lab-install/bin/vpp \
 
 现在使用以下单元：
 
-- `vpp-f0.service`：开机执行 `/usr/local/sbin/vpp-f0-start.sh`，脚本等到 `vppctl show version` 成功、完成 f0/punt/HTTP 配置后才 `touch /run/wan-cutover`。
+- `vpp-f0.service`：`Type=forking`，通过 `/run/vpp-dpdk/vpp.pid` 托管 VPP；开机执行 `/usr/local/sbin/vpp-f0-start.sh`，脚本加载 `vfio`、绑定 f0、等到 `vppctl show version` 成功且 `GigabitEthernet2/0/0` 存在，完成 punt/HTTP 配置后才 `touch /run/wan-cutover`。
 - `nginx-vcl.service`：在 `vpp-f0.service` 之后启动 `/usr/local/sbin/nginx-vcl-start.sh`；VPP 不可达时脚本会拒绝启动，不会再次出现 epoll busy loop。
 - `wan-watchdog.service`：marker 存在但 `vpp_main` 消失时先尝试重新执行 `vpp-f0-start.sh`；连续连通性失败仍按原逻辑回滚 WAN。
 
@@ -2652,4 +2652,21 @@ systemctl restart wan-watchdog.service
 ```
 
 不要在 VPP 未运行时手工绕过 `nginx-vcl-start.sh`；也不要使用 `set punt tcp 22`，当前 VPP 会返回 `punt TCP ports is not supported yet`。SSH 仍依赖 `set punt tcp all` 的 unknown-TCP punt 路径。
+
+重启后 DPDK 设备必须由 `vfio-pci` 接管。`src/scripts/vpp-modules-load.conf` 应安装为 `/etc/modules-load.d/vpp.conf`；启动脚本也会显式 `modprobe vfio vfio_iommu_type1 vfio-pci` 并执行 `dpdk-devbind.py --bind=vfio-pci 0000:02:00.0`。漏掉这一步时 VPP 会打印：
+
+```text
+vlib_pci_bind_to_uio: Skipping PCI device 0000:02:00.0: device is bound to IOMMU group and vfio-pci driver is not loaded
+```
+
+随后 `GigabitEthernet2/0/0` 不存在，旧脚本仍可能误报 `vpp-f0 ready`。现在启动脚本会检查该接口，缺失时直接失败。
+
+手动重启 VPP 前可先安排自动回滚：
+
+```bash
+systemd-run --on-active=60s /usr/local/sbin/vpp-start-guard.sh
+systemctl restart vpp-f0.service
+```
+
+guard 在 60 秒后检查 VPP 和公网 22；任一失败就停止 nginx-vcl、杀掉 VPP、把 f0 绑回 `igb` 并恢复 IP/默认路由。
 

@@ -2633,3 +2633,23 @@ gdb -q /root/netsystem-rs/third_party/vpp/build-vpp-lab-install/bin/vpp \
 
 本次同时加了两处防御：`http1_app_tx_callback`/`http1_app_rx_evt_callback` 先检查 request index 是否已释放，避免在连接关闭竞态中解引用 stale request；authority-form 解析在读取 `rx_buf[i + 1]` 前检查边界。它们不能替代 core 分析，但能避免同一类 use-after-free/越界读继续把 VPP 打崩。
 
+### 16.3 重启自启动与 watchdog 盲区
+
+2026-10-23 12:44:21 主机重启后 VPP 没有起来，原因不是 VPP 启动失败，而是它没有 systemd 自启动单元；`wan-watchdog.sh` 又只在 `/run/wan-cutover` 存在时才检查连通性，而 `/run` 是 tmpfs，重启后 marker 消失，所以 watchdog 从开机起就没有进入监控分支。
+
+现在使用以下单元：
+
+- `vpp-f0.service`：开机执行 `/usr/local/sbin/vpp-f0-start.sh`，脚本等到 `vppctl show version` 成功、完成 f0/punt/HTTP 配置后才 `touch /run/wan-cutover`。
+- `nginx-vcl.service`：在 `vpp-f0.service` 之后启动 `/usr/local/sbin/nginx-vcl-start.sh`；VPP 不可达时脚本会拒绝启动，不会再次出现 epoll busy loop。
+- `wan-watchdog.service`：marker 存在但 `vpp_main` 消失时先尝试重新执行 `vpp-f0-start.sh`；连续连通性失败仍按原逻辑回滚 WAN。
+
+部署文件在 `src/scripts/vpp-f0.service` 和 `src/scripts/nginx-vcl.service`。启用只影响下次开机，不会在部署命令执行时立刻启动 VPP：
+
+```bash
+systemctl daemon-reload
+systemctl enable vpp-f0.service nginx-vcl.service
+systemctl restart wan-watchdog.service
+```
+
+不要在 VPP 未运行时手工绕过 `nginx-vcl-start.sh`；也不要使用 `set punt tcp 22`，当前 VPP 会返回 `punt TCP ports is not supported yet`。SSH 仍依赖 `set punt tcp all` 的 unknown-TCP punt 路径。
+

@@ -1,0 +1,15 @@
+[Unit]
+Description=nginx on VPP VCL
+After=vpp-f0.service
+Wants=vpp-f0.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/nginx-vcl-start.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

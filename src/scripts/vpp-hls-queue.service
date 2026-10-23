@@ -8,7 +8,9 @@ Type=simple
 ExecStart=/usr/local/sbin/emby-hls-queue.py run --mode auto --segment-time 4 --max-width 1920
 Nice=10
 IOSchedulingClass=idle
-AllowedCPUs=4-39
+AllowedCPUs=10-19,30-39
+NUMAPolicy=bind
+NUMAMask=1
 Restart=on-failure
 RestartSec=30
 

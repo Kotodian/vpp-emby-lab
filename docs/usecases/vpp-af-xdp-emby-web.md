@@ -2690,5 +2690,7 @@ systemctl start vpp-hls-queue.service
 
 任务数据库在 `/var/lib/vpp-hls/queue.sqlite3`，每个任务的 ffmpeg 日志在 `/var/log/vpp-hls/task-<id>-<itemId>.log`。worker 串行执行，不并发压满磁盘；服务单元是 `src/scripts/vpp-hls-queue.service`。
 
+当前机器的 VPP lcore `1-3` 在 NUMA 0；HLS worker 使用 NUMA 1 的 `10-19,30-39`，并设置 `NUMAPolicy=bind`、`NUMAMask=1`。这样 ffmpeg 不占用 VPP 的 CPU，内存也绑定到 NUMA 1；可用 `numa_maps` 检查实际映射是否为 `bind:1`。
+
 队列 worker 只负责调度和调用 `emby-hls.py`，VPP 数据面仍然只做文件发送，不运行 ffmpeg。`run --mode auto` 会对 H.264 源使用 `--copy`，其他编码走 libx264 转码；`--skip-existing` 避免重复生成已有 master。
 

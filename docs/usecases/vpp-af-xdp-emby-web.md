@@ -320,7 +320,7 @@ server {
     location ~ ^/(emby/)?Videos/[^/]+/(stream|original) { proxy_pass http://vpp_media; }
     location ~ ^/(emby/)?Items/[^/]+/Download       { proxy_pass http://vpp_media; }
     location ~ ^/(emby/)?Audio/[^/]+/stream         { proxy_pass http://vpp_media; }
-    location ~ ^/(emby/)?Videos/[^/]+/master\.m3u8  { proxy_pass http://vpp_media; }
+    location ~ ^/(emby/)?Videos/[^/]+/(.+)$         { proxy_pass http://vpp_media; }
     location /hls/                                  { proxy_pass http://vpp_media; }
 
     # API：真实 Emby
@@ -878,7 +878,7 @@ server {
     location ~ ^/(emby/)?Videos/[^/]+/(stream|original) { proxy_pass http://vpp_media; }
     location ~ ^/(emby/)?Items/[^/]+/Download       { proxy_pass http://vpp_media; }
     location ~ ^/(emby/)?Audio/[^/]+/stream         { proxy_pass http://vpp_media; }
-    location ~ ^/(emby/)?Videos/[^/]+/master\.m3u8  { proxy_pass http://vpp_media; }
+    location ~ ^/(emby/)?Videos/[^/]+/(.+)$         { proxy_pass http://vpp_media; }
     location /hls/                                  { proxy_pass http://vpp_media; }
 
     # API：真实 Emby
@@ -2428,4 +2428,208 @@ Range 的关键是避免缓存 key 被 `Range` 打散：
 - [ ] 加每用户并发/带宽限制、单 IP 限流、日志脱敏和防盗链。
 - [ ] 用多台外部客户端压测；记录 p95 TTFB、命中率、回源字节、卡顿和源站出口。
 - [ ] 最后再决定 VPP 保留在 L3/L4、punt 还是 host-stack 终止；不要用调大 fifo 代替架构拆分。
+
+## 15. HLS 分片实现与使用
+
+### 15.1 目标与边界
+
+HLS 分片由外部 ffmpeg 任务预生成，VPP 进程只读文件，不启动转码器，也不在数据面调用 ffmpeg。生成的目录约定为：
+
+```text
+/srv/media/hls/<itemId>/master.m3u8
+/srv/media/hls/<itemId>/v<timestamp>-<pid>/main/index.m3u8
+/srv/media/hls/<itemId>/v<timestamp>-<pid>/main/seg_00000.ts
+```
+
+`master.m3u8` 最后原子替换，客户端不会看到生成到一半的播放列表。旧的版本目录可以保留用于回滚，也可以用 `--prune` 清理。
+
+### 15.2 media_server 路由
+
+`media_server` 现在支持以下映射：
+
+| 请求 | 实际文件 |
+|---|---|
+| `/Videos/<id>/stream`、`/Videos/<id>/original.mp4` | 索引中的原视频，Range/206 |
+| `/Videos/<id>/master.m3u8` | `/srv/media/hls/<id>/master.m3u8` |
+| `/Videos/<id>/<version>/main/index.m3u8` | `/srv/media/hls/<id>/<version>/main/index.m3u8` |
+| `/Videos/<id>/<version>/main/seg_00000.ts` | 对应分片 |
+| `/hls/<id>/...` | 直接访问 `/srv/media/hls/<id>/...` |
+
+`/emby/videos/<id>/...` 由 nginx 去掉 `/emby` 前缀后走同一套规则。请求 query 不参与文件路径，Range 仍由 `http_static` transport 统一处理。
+
+`.m3u8` 返回 `application/vnd.apple.mpegurl`，`.ts` 返回 `video/mp2t`。相对 URL 以 master 所在目录为基准，因此 master 中的 `v.../main/index.m3u8` 会自然解析到同一套 HLS 目录。
+
+### 15.3 生成 HLS
+
+脚本：`src/scripts/emby-hls.py`。默认从 `/srv/media/index.tsv` 查 `itemId`，使用 libx264 转码为单码率 HLS，分片 6 秒，最大宽度 1920。
+
+```bash
+# 单个条目
+src/scripts/emby-hls.py 21082
+
+# 全量生成，完成后删除每个条目的旧版本
+src/scripts/emby-hls.py --all --prune
+
+# 源已经是 H.264/AAC，直接 copy，速度快很多
+src/scripts/emby-hls.py 21082 --copy
+
+# 自定义分片和码率参数
+src/scripts/emby-hls.py 21082 \
+  --segment-time 4 --max-width 1280 --crf 22 --preset veryfast
+```
+
+环境变量：
+
+```text
+MEDIA_ROOT=/srv/media
+INDEX_OUT=/srv/media/index.tsv
+HLS_ROOT=/srv/media/hls
+```
+
+常用选项：
+
+- `--all`：对索引中的文件去重后批量生成；同一路径的数字 ID/GUID 别名不会重复编码。
+- `--copy`：只适合源视频编码和 HLS 客户端兼容的情况；否则默认 libx264 转码。
+- `--prune`：只保留本次生成的版本。
+- `--max-width`：限制输出宽度，避免 4K 源在小带宽链路上产生过大的分片。
+
+生成完成后不需要重启 VPP，`media_server` 每次请求直接打开文件。若索引路径变化，重新运行 `emby-index.py` 并在 VPP 中执行 `media server index reload`。
+
+### 15.4 nginx 路由
+
+如果 VPP 已加载本次修改后的 `media_server`，把 `/Videos/<id>/...` 原样转给 VPP 即可：
+
+```nginx
+location ~ ^/(emby/)?Videos/[^/]+/(stream|original) {
+    proxy_pass http://vpp_media;
+}
+location ~ ^/(emby/)?Videos/[^/]+/(.+)$ {
+    proxy_pass http://vpp_media;
+}
+location ~ ^/(emby/)?Items/[^/]+/Download {
+    proxy_pass http://vpp_media;
+}
+location ~ ^/(emby/)?Audio/[^/]+/stream {
+    proxy_pass http://vpp_media;
+}
+location /hls/ {
+    proxy_pass http://vpp_media;
+}
+```
+
+如果暂时不重启 VPP、还在用旧的 `media_server`，把 HLS location rewrite 到已有的 `/hls/` 树即可：
+
+```nginx
+location ~ ^/(emby/)?Videos/[^/]+/(.+)$ {
+    rewrite ^(?i)/(?:emby/)?Videos/([^/]+)/(.*)$ /hls/$1/$2 break;
+    proxy_pass http://vpp_media;
+}
+```
+
+注意：直接播放的 `stream|original` location 必须放在通用 HLS location 之前，否则 `stream.mp4` 会被当成 HLS 子路径。不要给 HLS location 加 `reuseport`，VCL listener 仍由 nginx master 继承。
+
+启动 nginx 前必须确认 VPP 仍在运行。VPP 不在时启动 VCL nginx，worker 会反复收到空的 `epoll_wait`，日志出现大量：
+
+```text
+epoll_wait() returned no events without timeout
+```
+
+并可能把 `/var/log/nginx/pornvpp-error.log` 迅速写到几十 GB。仓库里的 `src/scripts/nginx-vcl-start.sh` 会先执行 `vppctl show version`，VPP 不可达时直接拒绝启动；不要绕过这个检查直接 `LD_PRELOAD=... nginx`。
+
+### 15.5 验证
+
+```bash
+HOST=pornvpp.linqiankai.top
+BASE=https://${HOST}/Videos/21082
+
+# master playlist，应为 200，Content-Type 为 application/vnd.apple.mpegurl
+curl -4 -skS --noproxy '*' -D - -o /tmp/master.m3u8 "$BASE/master.m3u8"
+
+# 按 master 中的实际版本路径取 variant
+VARIANT=$(awk '/^[^#]/{print; exit}' /tmp/master.m3u8)
+curl -4 -skS --noproxy '*' -D - -o /tmp/index.m3u8 "$BASE/$VARIANT"
+
+# 取第一个分片，并验证 Range/206
+SEG=$(awk '/^[^#]/{print; exit}' /tmp/index.m3u8)
+curl -4 -skS --noproxy '*' -r 0-1023 -D - -o /tmp/seg.part "$BASE/$(dirname "$VARIANT")/$SEG"
+
+# 用 ffprobe 验证播放列表可解析
+ffprobe -v error -show_entries format=duration -of default=nw=1 "$BASE/master.m3u8"
+```
+
+HLS 只改变分发形态，不会自动解决大陆跨境带宽或内容合规问题。真正上线前仍应按第 14 节把 edge 文件服务、CDN 缓存 key、签名 URL 和源站鉴权拆开；`m3u8` 用短 TTL，`ts`/`m4s` 用内容寻址后的长 TTL。
+
+## 16. VPP 崩溃与 core dump
+
+### 16.1 开启 core
+
+VPP 支持在启动配置里直接调整 RLIMIT_CORE 和 coredump filter：
+
+```text
+unix {
+  nodaemon
+  coredump-size unlimited
+  full-coredump
+  cli-listen /run/vpp-dpdk/cli.sock
+  log /var/log/vpp-dpdk/vpp.log
+  runtime-dir /run/vpp-dpdk
+}
+```
+
+启动脚本在拉起 VPP 前还要执行：
+
+```bash
+ulimit -c unlimited
+```
+
+内核侧不要依赖 apport 的默认 pipe，直接把 core 落到 `/var/crash`：
+
+```text
+# /etc/sysctl.d/99-vpp-core.conf
+kernel.core_pattern=/var/crash/core.%e.%p.%t
+kernel.core_uses_pid=1
+```
+
+```bash
+sysctl --system
+cat /proc/sys/kernel/core_pattern
+```
+
+验证运行中的 VPP 确实拿到了 unlimited：
+
+```bash
+cat /proc/$(pgrep -x vpp_main)/limits | grep -i core
+```
+
+应看到 `Max core file size unlimited`。core 文件形如 `/var/crash/core.vpp.<pid>.<timestamp>`。
+
+### 16.2 崩溃现场
+
+2026-10-23 12:12:11，VPP 在 HTTP1 路径崩溃：
+
+```text
+http1_app_tx_callback:1973: ... invalid tx state: http req state 'wait transport method', session state 'ESTABLISHED'
+http1_parse_request_line:264: request line incomplete
+received signal SIGSEGV, PC 0x9206, faulting address 0x9206
+PC contains invalid memory address
+```
+
+随后 watchdog 在 12:12:38 判定 WAN 不可达并回滚 `enp2s0f0` 到内核 `igb`。这说明 **VPP 是先崩溃，watchdog 后回滚**，不是 watchdog 主动杀死了正常的 VPP。崩溃发生在 HTTP1/VCL 连接处理，具体调用栈必须用 core 确认；在拿到 core 前不要把 `0x9206` 解释成业务代码地址。
+
+拿到 core 后：
+
+```bash
+gdb -q /root/netsystem-rs/third_party/vpp/build-vpp-lab-install/bin/vpp \
+  /var/crash/core.vpp.<pid>.<timestamp>
+
+(gdb) set pagination off
+(gdb) thread apply all bt full
+(gdb) info registers
+(gdb) p vlib_last_signum
+(gdb) p vlib_last_faulting_address
+```
+
+如果栈里落到 `http1_app_tx_callback` 或 `http1_parse_request_line`，下一步应优先检查 VCL/nginx 关闭连接、短读和半包请求的状态机，而不是调 TCP 参数。
+
+本次同时加了两处防御：`http1_app_tx_callback`/`http1_app_rx_evt_callback` 先检查 request index 是否已释放，避免在连接关闭竞态中解引用 stale request；authority-form 解析在读取 `rx_buf[i + 1]` 前检查边界。它们不能替代 core 分析，但能避免同一类 use-after-free/越界读继续把 VPP 打崩。
 

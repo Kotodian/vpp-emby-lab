@@ -118,6 +118,8 @@ typedef enum http_msg_type_
   _ (APP_TAR, ".tar", "application/x-tar")                                    \
   _ (APP_VSD, ".vsd", "application/vnd.visio")                                \
   _ (APP_XHTML, ".xhtml", "application/xhtml+xml")                            \
+  _ (APP_VND_APPLE_MPEGURL, ".m3u8",                                           \
+     "application/vnd.apple.mpegurl")                                         \
   _ (APP_XLS, ".xls", "application/vnd.ms-excel")                             \
   _ (APP_XML, ".xml", "application/xml")                                      \
   _ (APP_XSLX, ".xlsx",                                                       \

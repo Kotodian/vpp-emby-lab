@@ -54,7 +54,7 @@ ms_content_type (u8 *path)
   if (!strcasecmp (ext, ".ts"))
     return HTTP_CONTENT_VIDEO_TS;
   if (!strcasecmp (ext, ".m3u8"))
-    return HTTP_CONTENT_TEXT_PLAIN;
+    return HTTP_CONTENT_APP_VND_APPLE_MPEGURL;
   if (!strcasecmp (ext, ".txt"))
     return HTTP_CONTENT_TEXT_PLAIN;
   return HTTP_CONTENT_APP_OCTET_STREAM;
@@ -79,6 +79,57 @@ ms_not_found (hss_url_handler_args_t *args)
 {
   ms_reply (args, HTTP_STATUS_NOT_FOUND, HTTP_CONTENT_TEXT_PLAIN,
 	    format (0, "not found\n"));
+}
+
+static int
+ms_component_is_safe (u8 *s, uword len)
+{
+  uword i;
+
+  if (len == 0 || (len == 1 && s[0] == '.') ||
+      (len == 2 && s[0] == '.' && s[1] == '.'))
+    return 0;
+
+  for (i = 0; i < len; i++)
+    if (s[i] == '/' || s[i] == '\\')
+      return 0;
+
+  return 1;
+}
+
+static int
+ms_relative_path_is_safe (u8 *path)
+{
+  u8 *slash;
+  uword len;
+
+  if (path == 0 || path[0] == 0 || path[0] == '/')
+    return 0;
+
+  while (path[0])
+    {
+      slash = (u8 *) strchr ((char *) path, '/');
+      len = slash ? slash - path : strlen ((char *) path);
+      if (!ms_component_is_safe (path, len))
+	return 0;
+      if (slash == 0)
+	break;
+      path = slash + 1;
+    }
+
+  return 1;
+}
+
+static int
+ms_is_direct_file_name (u8 *name)
+{
+  if (strchr ((char *) name, '/'))
+    return 0;
+
+  return !strcasecmp ((char *) name, "stream") ||
+	 !strcasecmp ((char *) name, "original") ||
+	 !strncasecmp ((char *) name, "stream.", 7) ||
+	 !strncasecmp ((char *) name, "original.", 9);
 }
 
 static void
@@ -243,20 +294,43 @@ ms_serve_id (hss_url_handler_args_t *args, u8 *id, uword idlen)
 {
   media_server_main_t *mm = &media_server_main;
   ms_item_t *it = ms_lookup (id, idlen);
+  uword root_len = strlen ((char *) mm->media_root);
+  uword path_len;
 
   if (it == 0)
     {
       ms_not_found (args);
       return;
     }
+  path_len = strlen ((char *) it->path);
+
   /* Only files under the media root may be served from the index. */
-  if (strncmp ((char *) it->path, (char *) mm->media_root,
-	       strlen ((char *) mm->media_root)) != 0)
+  if (path_len < root_len ||
+      strncmp ((char *) it->path, (char *) mm->media_root, root_len) != 0 ||
+      (path_len > root_len && it->path[root_len] != '/'))
     {
       ms_not_found (args);
       return;
     }
   ms_serve_path (args, it->path);
+}
+
+static void
+ms_serve_hls_id (hss_url_handler_args_t *args, u8 *id, uword idlen, u8 *rel)
+{
+  media_server_main_t *mm = &media_server_main;
+  u8 *path;
+
+  if (!ms_component_is_safe (id, idlen) || !ms_relative_path_is_safe (rel))
+    {
+      ms_not_found (args);
+      return;
+    }
+
+  path = format (0, "%s/hls/%.*s/%s%c", mm->media_root, (int) idlen, id, rel,
+		 0);
+  ms_serve_path (args, path);
+  vec_free (path);
 }
 
 static hss_url_handler_rc_t
@@ -277,24 +351,32 @@ ms_get_handler (hss_url_handler_args_t *args)
       return HSS_URL_HANDLER_OK;
     }
 
-  if (!strncmp ((char *) path, "emby/", 5))
+  if (!strncasecmp ((char *) path, "emby/", 5))
     path += 5;
 
-  if (!strncmp ((char *) path, "Videos/", 7))
+  if (!strncasecmp ((char *) path, "Videos/", 7))
     {
       id = path + 7;
       idlen = strcspn ((char *) id, "/");
-      ms_serve_id (args, id, idlen);
+      rel = id + idlen;
+      if (rel[0] == '/')
+	rel++;
+      if (idlen == 0)
+	ms_not_found (args);
+      else if (rel[0] == 0 || ms_is_direct_file_name (rel))
+	ms_serve_id (args, id, idlen);
+      else
+	ms_serve_hls_id (args, id, idlen, rel);
       return HSS_URL_HANDLER_OK;
     }
-  if (!strncmp ((char *) path, "Items/", 6))
+  if (!strncasecmp ((char *) path, "Items/", 6))
     {
       id = path + 6;
       idlen = strcspn ((char *) id, "/");
       ms_serve_id (args, id, idlen);
       return HSS_URL_HANDLER_OK;
     }
-  if (!strncmp ((char *) path, "Audio/", 6))
+  if (!strncasecmp ((char *) path, "Audio/", 6))
     {
       id = path + 6;
       idlen = strcspn ((char *) id, "/");
@@ -302,9 +384,9 @@ ms_get_handler (hss_url_handler_args_t *args)
       return HSS_URL_HANDLER_OK;
     }
 
-  if (!strncmp ((char *) path, "media/", 6))
+  if (!strncasecmp ((char *) path, "media/", 6))
     rel = path + 6;
-  else if (!strncmp ((char *) path, "hls/", 4))
+  else if (!strncasecmp ((char *) path, "hls/", 4))
     rel = path;
   else
     {
@@ -312,13 +394,17 @@ ms_get_handler (hss_url_handler_args_t *args)
       return HSS_URL_HANDLER_OK;
     }
 
-  if (rel[0] == 0 || rel[0] == '/' || strstr ((char *) rel, ".."))
+  if (!ms_relative_path_is_safe (rel))
     {
       ms_not_found (args);
       return HSS_URL_HANDLER_OK;
     }
 
-  ms_serve_path (args, format (0, "%s/%s%c", mm->media_root, rel, 0));
+  {
+    u8 *file_path = format (0, "%s/%s%c", mm->media_root, rel, 0);
+    ms_serve_path (args, file_path);
+    vec_free (file_path);
+  }
   return HSS_URL_HANDLER_OK;
 }
 

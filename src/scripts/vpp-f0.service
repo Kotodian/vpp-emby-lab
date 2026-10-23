@@ -6,11 +6,13 @@ StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=forking
+PIDFile=/run/vpp-dpdk/vpp.pid
 ExecStart=/usr/local/sbin/vpp-f0-start.sh
+ExecStop=/usr/local/sbin/vpp-f0-stop.sh
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

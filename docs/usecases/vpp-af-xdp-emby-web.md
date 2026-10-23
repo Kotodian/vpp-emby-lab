@@ -2670,3 +2670,25 @@ systemctl restart vpp-f0.service
 
 guard 在 60 秒后检查 VPP 和公网 22；任一失败就停止 nginx-vcl、杀掉 VPP、把 f0 绑回 `igb` 并恢复 IP/默认路由。
 
+## 17. 已有视频的 HLS 任务队列
+
+不要手动逐条运行 `emby-hls.py`。已有视频使用 SQLite 队列：
+
+```bash
+# 已有视频入队，已经有 master.m3u8 的跳过
+/usr/local/sbin/emby-hls-queue.py enqueue --all --skip-existing
+
+# 查看 pending/running/done/failed
+/usr/local/sbin/emby-hls-queue.py status
+
+# 启动单个串行 worker（Nice=10、IO idle）
+systemctl start vpp-hls-queue.service
+
+# 失败重试
+/usr/local/sbin/emby-hls-queue.py retry --all
+```
+
+任务数据库在 `/var/lib/vpp-hls/queue.sqlite3`，每个任务的 ffmpeg 日志在 `/var/log/vpp-hls/task-<id>-<itemId>.log`。worker 串行执行，不并发压满磁盘；服务单元是 `src/scripts/vpp-hls-queue.service`。
+
+队列 worker 只负责调度和调用 `emby-hls.py`，VPP 数据面仍然只做文件发送，不运行 ffmpeg。`run --mode auto` 会对 H.264 源使用 `--copy`，其他编码走 libx264 转码；`--skip-existing` 避免重复生成已有 master。
+

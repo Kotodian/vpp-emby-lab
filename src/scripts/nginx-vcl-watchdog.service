@@ -1,0 +1,13 @@
+[Unit]
+Description=nginx VCL listener and log watchdog
+After=vpp-f0.service nginx-vcl.service
+Wants=nginx-vcl.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/nginx-vcl-watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

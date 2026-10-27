@@ -1,0 +1,18 @@
+[Unit]
+Description=VPP DPDK L4 load balancer
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=forking
+PIDFile=/run/vpp-lb/vpp.pid
+ExecStart=/usr/local/sbin/vpp-lb-start.sh
+ExecStop=/usr/local/sbin/vpp-lb-stop.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

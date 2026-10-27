@@ -1,0 +1,12 @@
+[Unit]
+Description=VPP LB SSH/DPDK watchdog
+After=vpp-lb.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/vpp-lb-watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

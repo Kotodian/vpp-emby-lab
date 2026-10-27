@@ -868,13 +868,101 @@ tcp_handle_old_ack (tcp_connection_t *tc, tcp_ack_ctx_t *ac, u32 ack)
 }
 
 /**
+ * Account for newly acknowledged bytes and advance snd_una.
+ *
+ * Reached through tcp_ack_process() from both the generic ACK path and the
+ * header prediction fast path.
+ */
+static_always_inline void
+tcp_ack_commit (tcp_worker_ctx_t * wrk, tcp_connection_t * tc, u32 ack,
+		tcp_ack_ctx_t * ac)
+{
+  tc->snd_una = ack;
+  tcp_validate_txf_size (tc, ac->bytes_acked);
+
+  if (ac->bytes_acked + ac->last_sacked_bytes)
+    {
+      tcp_update_rtt (tc, ac, ack);
+      if (ac->bytes_acked)
+	tcp_program_dequeue (wrk, tc, ac);
+    }
+}
+
+/**
+ * Run loss detection and congestion event processing for an ACK.
+ *
+ * Returns 0 if the segment can be processed further, -1 if it must be
+ * dropped.
+ */
+static_always_inline int
+tcp_ack_handle_event (tcp_connection_t * tc, vlib_buffer_t * b, tcp_header_t * th,
+		      u32 ack, tcp_ack_ctx_t * ac, u32 * error)
+{
+  if (tcp_tlp_is_pending (tc))
+    tcp_tlp_process_ack (tc, ack, ac);
+
+  if (ac->ack_flags & TCP_ACK_F_DETECT_LOSS)
+    tcp_loss_on_ack (tc, ac);
+
+  tcp_cc_handle_event (tc, ac);
+  tc->dupacks_in += !!(ac->ack_flags & TCP_ACK_F_DUPACK);
+  if (!tcp_in_cong_recovery (tc))
+    {
+      *error = TCP_ERROR_ACK_OK;
+      return 0;
+    }
+  *error = TCP_ERROR_ACK_DUP;
+  if (vnet_buffer (b)->tcp.data_len || tcp_is_fin (th))
+    return 0;
+  return -1;
+}
+
+/**
+ * Process the ACK of a segment that passed the sanity checks.
+ *
+ * Returns 0 if the segment can be processed further, -1 if it must be
+ * dropped. Shared by tcp_rcv_ack() and the header prediction fast path.
+ */
+static_always_inline int
+tcp_ack_process (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
+		 vlib_buffer_t * b, tcp_header_t * th, u32 ack,
+		 tcp_ack_ctx_t * ac, u32 * error)
+{
+  u32 prev_snd_wnd = tc->snd_wnd;
+
+  tcp_update_snd_wnd (tc, vnet_buffer (b)->tcp.seq_number, ack,
+		      clib_net_to_host_u16 (th->window) << tc->snd_wscale);
+
+  tcp_ack_handle_feedback (tc, ack, ac);
+
+  tcp_ack_commit (wrk, tc, ack, ac);
+
+  ac->ack_flags |= tcp_ack_classify_duplicate (tc, b, prev_snd_wnd, ac);
+
+  TCP_EVT (TCP_EVT_ACK_RCVD, tc, ac);
+
+  /*
+   * Check if we have congestion event
+   */
+  if (tcp_ack_needs_slow_path (tc, ac))
+    return tcp_ack_handle_event (tc, b, th, ack, ac, error);
+
+  /*
+   * Update congestion control (slow start/congestion avoidance)
+   */
+  tcp_cc_update (tc, ac);
+  *error = TCP_ERROR_ACK_OK;
+  return 0;
+}
+
+/**
  * Process incoming ACK
  */
 static int
 tcp_rcv_ack (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, vlib_buffer_t *b, tcp_header_t *th,
 	     u32 *error)
 {
-  u32 ack = vnet_buffer (b)->tcp.ack_number, prev_snd_wnd;
+  u32 ack = vnet_buffer (b)->tcp.ack_number;
   tcp_ack_ctx_t ac = { 0 };
 
   TCP_EVT (TCP_EVT_CC_STAT, tc);
@@ -910,58 +998,7 @@ tcp_rcv_ack (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, vlib_buffer_t *b, tcp_
   /*
    * Looks okay, process feedback
    */
-
-  prev_snd_wnd = tc->snd_wnd;
-  tcp_update_snd_wnd (tc, vnet_buffer (b)->tcp.seq_number, ack,
-		      clib_net_to_host_u16 (th->window) << tc->snd_wscale);
-
-  tcp_ack_handle_feedback (tc, ack, &ac);
-
-  tc->snd_una = ack;
-  tcp_validate_txf_size (tc, ac.bytes_acked);
-
-  if (ac.bytes_acked + ac.last_sacked_bytes)
-    {
-      tcp_update_rtt (tc, &ac, ack);
-      if (ac.bytes_acked)
-	tcp_program_dequeue (wrk, tc, &ac);
-    }
-
-  ac.ack_flags |= tcp_ack_classify_duplicate (tc, b, prev_snd_wnd, &ac);
-
-  TCP_EVT (TCP_EVT_ACK_RCVD, tc, &ac);
-
-  /*
-   * Check if we have congestion event
-   */
-
-  if (tcp_ack_needs_slow_path (tc, &ac))
-    {
-      if (tcp_tlp_is_pending (tc))
-	tcp_tlp_process_ack (tc, ack, &ac);
-
-      if (ac.ack_flags & TCP_ACK_F_DETECT_LOSS)
-	tcp_loss_on_ack (tc, &ac);
-
-      tcp_cc_handle_event (tc, &ac);
-      tc->dupacks_in += !!(ac.ack_flags & TCP_ACK_F_DUPACK);
-      if (!tcp_in_cong_recovery (tc))
-	{
-	  *error = TCP_ERROR_ACK_OK;
-	  return 0;
-	}
-      *error = TCP_ERROR_ACK_DUP;
-      if (vnet_buffer (b)->tcp.data_len || tcp_is_fin (th))
-	return 0;
-      return -1;
-    }
-
-  /*
-   * Update congestion control (slow start/congestion avoidance)
-   */
-  tcp_cc_update (tc, &ac);
-  *error = TCP_ERROR_ACK_OK;
-  return 0;
+  return tcp_ack_process (wrk, tc, b, th, ack, &ac, error);
 }
 
 static void
@@ -1387,6 +1424,98 @@ tcp_segment_handle_exception (tcp_connection_t *tc, tcp_header_t *th,
     }
 }
 
+/**
+ * Header prediction fast path.
+ *
+ * Handles the steady-state segments whose sequence and acknowledgement
+ * numbers are exactly what the receive path expects, skipping the generic
+ * window, RST/SYN and old/future ACK checks. The ACK itself is processed by
+ * the same pipeline as the generic path, so byte tracker, RACK, SACK and
+ * loss recovery behave identically.
+ */
+static_always_inline int
+tcp_established_fast_path (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
+			   vlib_buffer_t * b, tcp_header_t * th, u32 * error)
+{
+  tcp_ack_ctx_t ac = { 0 };
+  u32 seq = vnet_buffer (b)->tcp.seq_number;
+  u32 ack = vnet_buffer (b)->tcp.ack_number;
+  u8 has_data = vnet_buffer (b)->tcp.data_len != 0;
+  u8 allowed_flags = TCP_FLAG_ACK | (has_data ? TCP_FLAG_PSH : 0);
+
+  if (PREDICT_FALSE ((th->flags & ~allowed_flags) ||
+		     !(th->flags & TCP_FLAG_ACK)))
+    return 0;
+  if (PREDICT_FALSE (tc->state != TCP_STATE_ESTABLISHED ||
+		     seq != tc->rcv_nxt))
+    return 0;
+
+  /* In-order data must not acknowledge anything new; a pure ACK must
+   * advance snd_una without acknowledging unsent bytes. With seq == rcv_nxt
+   * this also covers the generic window and RST/SYN checks. */
+  if (PREDICT_FALSE (has_data ?
+		     ack != tc->snd_una :
+		     (!seq_gt (ack, tc->snd_una) || seq_gt (ack, tc->snd_nxt))))
+    return 0;
+
+  if (PREDICT_FALSE (tcp_options_parse (th, &tc->rcv_opts, 0)))
+    return 0;
+  if (PREDICT_FALSE (tcp_segment_check_paws (tc)))
+    return 0;
+  tcp_update_timestamp (tc, seq, vnet_buffer (b)->tcp.seq_end);
+
+  TCP_EVT (TCP_EVT_CC_STAT, tc);
+
+  /* Same pipeline as the generic path, byte tracker and RACK sampling
+   * included. Its drop outcome only happens for segments without data and
+   * is reported through *error. */
+  tcp_ack_process (wrk, tc, b, th, ack, &ac, error);
+
+  if (has_data)
+    *error = tcp_segment_rcv (wrk, tc, b);
+  return 1;
+}
+
+/**
+ * Run the established-state input pipeline for a single segment.
+ */
+always_inline void
+tcp_established_process_buffer (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
+				vlib_buffer_t * b, u32 * error)
+{
+  tcp_header_t *th = tcp_buffer_hdr (b);
+
+  if (PREDICT_FALSE (tcp_segment_is_exception (tc, th)))
+    {
+      tcp_segment_handle_exception (tc, th, error);
+      return;
+    }
+
+  if (PREDICT_TRUE (tcp_established_fast_path (wrk, tc, b, th, error)))
+    return;
+
+  /* 1-4: check SEQ, RST, SYN */
+  if (PREDICT_FALSE (tcp_segment_validate (wrk, tc, b, th, error)))
+    {
+      TCP_EVT (TCP_EVT_SEG_INVALID, tc, vnet_buffer (b)->tcp);
+      return;
+    }
+
+  /* 5: check the ACK field  */
+  if (PREDICT_FALSE (tcp_rcv_ack (wrk, tc, b, th, error)))
+    return;
+
+  /* 6: check the URG bit TODO */
+
+  /* 7: process the segment text */
+  if (vnet_buffer (b)->tcp.data_len)
+    *error = tcp_segment_rcv (wrk, tc, b);
+
+  /* 8: check the FIN bit */
+  if (PREDICT_FALSE (tcp_is_fin (th)))
+    tcp_rcv_fin (wrk, tc, b, error);
+}
+
 always_inline uword
 tcp46_established_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
 			  vlib_frame_t * frame, int is_ip4)
@@ -1406,52 +1535,57 @@ tcp46_established_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
   vlib_get_buffers (vm, from, bufs, n_left_from);
   b = bufs;
 
+  while (n_left_from >= 4)
+    {
+      tcp_connection_t *tc0, *tc1, *tc2, *tc3;
+      u32 error0 = TCP_ERROR_ACK_OK, error1 = TCP_ERROR_ACK_OK;
+
+      /* Prefetch the next pair of buffers and their connections. */
+      vlib_prefetch_buffer_header (b[2], STORE);
+      vlib_prefetch_buffer_header (b[3], STORE);
+      CLIB_PREFETCH (b[2]->data, 2 * CLIB_CACHE_LINE_BYTES, LOAD);
+      CLIB_PREFETCH (b[3]->data, 2 * CLIB_CACHE_LINE_BYTES, LOAD);
+
+      tc2 = tcp_worker_connection_get (wrk,
+				       vnet_buffer (b[2])->tcp.connection_index);
+      tc3 = tcp_worker_connection_get (wrk,
+				       vnet_buffer (b[3])->tcp.connection_index);
+      CLIB_PREFETCH (tc2, 2 * CLIB_CACHE_LINE_BYTES, LOAD);
+      CLIB_PREFETCH (tc3, 2 * CLIB_CACHE_LINE_BYTES, LOAD);
+
+      tc0 = tcp_worker_connection_get (wrk,
+				       vnet_buffer (b[0])->tcp.connection_index);
+      tc1 = tcp_worker_connection_get (wrk,
+				       vnet_buffer (b[1])->tcp.connection_index);
+
+      tcp_established_process_buffer (wrk, tc0, b[0], &error0);
+      tcp_established_process_buffer (wrk, tc1, b[1], &error1);
+
+      tcp_inc_err_counter (&err_counters, error0, 1);
+      tcp_inc_err_counter (&err_counters, error1, 1);
+
+      b += 2;
+      n_left_from -= 2;
+    }
+
   while (n_left_from > 0)
     {
       u32 error = TCP_ERROR_ACK_OK;
       tcp_connection_t *tc;
-      tcp_header_t *th;
 
       if (n_left_from > 1)
 	{
-	  vlib_prefetch_buffer_header (b[1], LOAD);
+	  vlib_prefetch_buffer_header (b[1], STORE);
 	  CLIB_PREFETCH (b[1]->data, 2 * CLIB_CACHE_LINE_BYTES, LOAD);
 	}
 
-      tc = tcp_worker_connection_get (wrk, vnet_buffer (b[0])->tcp.connection_index);
-      th = tcp_buffer_hdr (b[0]);
+      tc = tcp_worker_connection_get (wrk,
+				      vnet_buffer (b[0])->tcp.connection_index);
 
-      if (PREDICT_FALSE (tcp_segment_is_exception (tc, th)))
-	{
-	  tcp_segment_handle_exception (tc, th, &error);
-	  goto done;
-	}
+      tcp_established_process_buffer (wrk, tc, b[0], &error);
 
-      /* TODO header prediction fast path */
-
-      /* 1-4: check SEQ, RST, SYN */
-      if (PREDICT_FALSE (tcp_segment_validate (wrk, tc, b[0], th, &error)))
-	{
-	  TCP_EVT (TCP_EVT_SEG_INVALID, tc, vnet_buffer (b[0])->tcp);
-	  goto done;
-	}
-
-      /* 5: check the ACK field  */
-      if (PREDICT_FALSE (tcp_rcv_ack (wrk, tc, b[0], th, &error)))
-	goto done;
-
-      /* 6: check the URG bit TODO */
-
-      /* 7: process the segment text */
-      if (vnet_buffer (b[0])->tcp.data_len)
-	error = tcp_segment_rcv (wrk, tc, b[0]);
-
-      /* 8: check the FIN bit */
-      if (PREDICT_FALSE (tcp_is_fin (th)))
-	tcp_rcv_fin (wrk, tc, b[0], &error);
-
-    done:
       tcp_inc_err_counter (&err_counters, error, 1);
+
       n_left_from -= 1;
       b += 1;
     }

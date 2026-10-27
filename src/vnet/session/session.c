@@ -966,7 +966,8 @@ session_transport_closing_notify (transport_connection_t * tc)
   app_worker_t *app_wrk;
   session_t *s;
 
-  s = session_get (tc->s_index, tc->thread_index);
+  if (!(s = session_get_if_valid (tc->s_index, tc->thread_index)))
+    return;
   if (s->session_state >= SESSION_STATE_TRANSPORT_CLOSING)
     return;
 

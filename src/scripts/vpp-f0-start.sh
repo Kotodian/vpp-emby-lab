@@ -31,6 +31,15 @@ if ! pgrep -x vpp_main >/dev/null; then
   fi
 fi
 
+# Type=forking uses this file to track the VPP process.  VPP normally writes
+# it itself, but make sure systemd can still adopt an already-running VPP
+# when this script is used to recover the unit.
+pid=$(pgrep -x vpp_main | head -n 1)
+if [ -n "$pid" ]; then
+  mkdir -p /run/vpp-dpdk
+  echo "$pid" > /run/vpp-dpdk/vpp.pid
+fi
+
 $VCTL create loopback interface instance 0 >/dev/null 2>&1 || true
 $VCTL set interface state loop0 up >/dev/null 2>&1 || true
 $VCTL set interface ip address loop0 10.255.0.1/32 >/dev/null 2>&1 || true
@@ -55,6 +64,13 @@ ip addr add 184.107.84.201/32 dev vpp-punt 2>/dev/null || true
 ip addr add 10.30.0.2/30 dev vpp-punt 2>/dev/null || true
 ip route add default via 10.30.0.1 dev vpp-punt src 184.107.84.201 2>/dev/null || true
 sysctl -w net.ipv4.conf.vpp-punt.rp_filter=2 >/dev/null 2>&1 || true
+
+# Docker MASQUERADE picks vpp-punt's 10.30.0.2 instead of the public address,
+# so container traffic leaves with an unroutable source. Pin it explicitly.
+for net in 172.17.0.0/16 172.18.0.0/16; do
+  iptables -t nat -D POSTROUTING -s "$net" -o vpp-punt -j SNAT --to-source 184.107.84.201 2>/dev/null || true
+  iptables -t nat -I POSTROUTING 1 -s "$net" -o vpp-punt -j SNAT --to-source 184.107.84.201
+done
 
 resolvectl dns vpp-punt 23.19.53.53 23.19.52.52 >/dev/null 2>&1 || true
 resolvectl domain vpp-punt '~.' >/dev/null 2>&1 || true

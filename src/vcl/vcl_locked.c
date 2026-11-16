@@ -1764,13 +1764,16 @@ int
 vls_epoll_wait (vls_handle_t ep_vlsh, struct epoll_event *events,
 		int maxevents, double wait_for_time)
 {
-  vcl_locked_session_t *vls, *vls_tmp = NULL;
+  vcl_locked_session_t *vls;
   int rv;
 
   vls_mt_detect ();
   if (!(vls = vls_get_w_dlock (ep_vlsh)))
     return VPPCOM_EBADFD;
-  vls_mt_guard (vls_tmp, VLS_MT_OP_XPOLL);
+  /* An epoll created before the application's network thread starts must
+   * migrate just like epoll_ctl. A NULL guard skips that migration and
+   * interprets the owner's session index in the new worker's pool. */
+  vls_mt_guard (vls, VLS_MT_OP_XPOLL);
   rv = vppcom_epoll_wait (vls_to_sh_tu (vls), events, maxevents,
 			  wait_for_time);
   vls_mt_unguard ();

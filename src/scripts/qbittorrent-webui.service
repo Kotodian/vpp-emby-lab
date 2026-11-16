@@ -1,0 +1,9 @@
+[Unit]
+Description=Local qBittorrent WebUI proxy to VPP
+After=qbittorrent.service qbittorrent-webui.socket
+Requires=qbittorrent-webui.socket
+BindsTo=qbittorrent.service
+
+[Service]
+ExecStart=/usr/local/sbin/qbittorrent-webui-proxy.sh
+NoNewPrivileges=true

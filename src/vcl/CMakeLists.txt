@@ -69,6 +69,21 @@ add_vpp_library(vcl_ldpreload
   LINK_LIBRARIES
   vppinfra svm vlibmemoryclient rt pthread vppcom dl
 )
+
+add_vpp_tool(vcl_socket_proxy
+  SOURCES socket_proxy.c
+  NO_INSTALL
+)
+
+option(VPP_BUILD_VCL_TESTS "Build VCL tests" ON)
+if(VPP_BUILD_VCL_TESTS)
+  add_vpp_test(vcl_ldp_socket_test
+    SOURCES test_socket.c
+    LINK_LIBRARIES vcl_ldpreload vppcom vppinfra svm dl pthread
+    ENABLE_EXPORTS
+    NO_INSTALL
+  )
+endif()
 endif()
 
 add_vpp_headers(vcl

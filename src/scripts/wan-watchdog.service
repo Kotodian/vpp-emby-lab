@@ -1,0 +1,16 @@
+[Unit]
+Description=Core-preserving VPP WAN recovery watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/wan-watchdog.sh
+Restart=always
+RestartSec=2
+# An older version launched VPP in this cgroup. Preserve that running VPP
+# when replacing/restarting only the watchdog.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

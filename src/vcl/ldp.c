@@ -14,6 +14,9 @@
 #include <pthread.h>
 #include <time.h>
 #include <stdarg.h>
+#include <limits.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
@@ -65,6 +68,7 @@
 typedef struct ldp_worker_ctx_
 {
   u8 *io_buffer;
+  u8 *dgram_buffer;
   clib_time_t clib_time;
 
   /*
@@ -85,7 +89,7 @@ typedef struct ldp_worker_ctx_
    */
   vcl_poll_t *vcl_poll;
   struct pollfd *libc_poll;
-  u16 *libc_poll_idxs;
+  u32 *libc_poll_idxs;
 
   /*
    * Epoll state
@@ -130,8 +134,8 @@ typedef struct
     }
 
 static ldp_main_t ldp_main = {
-  .vlsh_bit_val = (1 << LDP_SID_BIT_MIN),
-  .vlsh_bit_mask = (1 << LDP_SID_BIT_MIN) - 1,
+  .vlsh_bit_val = (1 << LDP_SID_BIT_DEFAULT),
+  .vlsh_bit_mask = (1 << LDP_SID_BIT_DEFAULT) - 1,
   .debug = LDP_DEBUG_INIT,
   .transparent_tls = 0,
   .ckpair_index = ~0,
@@ -172,7 +176,7 @@ ldp_vlsh_to_fd (vls_handle_t vlsh)
 static inline vls_handle_t
 ldp_fd_to_vlsh (int fd)
 {
-  if (fd < ldp->vlsh_bit_val)
+  if (fd < 0 || (u32) fd < ldp->vlsh_bit_val)
     return VLS_INVALID_HANDLE;
 
   return (fd - ldp->vlsh_bit_val);
@@ -274,6 +278,15 @@ ldp_init (void)
     }
 
   ldp_init_cfg ();
+  if (!getenv (LDP_ENV_SID_BIT))
+    {
+      struct rlimit limit;
+      if (getrlimit (RLIMIT_NOFILE, &limit) || limit.rlim_max > ldp->vlsh_bit_val)
+	{
+	  fprintf (stderr, "LDP: kernel fd limit overlaps VCL fd range\n");
+	  return -EINVAL;
+	}
+    }
   ldp->init = 1;
   vls_set_epoll_fns (
     (vls_epoll_fns_t){ libc_epoll_create1, libc_epoll_ctl, libc_epoll_wait });
@@ -494,7 +507,7 @@ fcntl_internal (int fd, int cmd, va_list ap)
   LDBG (0, "fd %u vlsh %d, cmd %u", fd, vlsh, cmd);
   if (vlsh != VLS_INVALID_HANDLE)
     {
-      int flags = va_arg (ap, int);
+      int flags;
       u32 size;
 
       size = sizeof (flags);
@@ -502,6 +515,7 @@ fcntl_internal (int fd, int cmd, va_list ap)
       switch (cmd)
 	{
 	case F_SETFL:
+	  flags = va_arg (ap, int);
 	  rv = vls_attr (vlsh, VPPCOM_ATTR_SET_FLAGS, &flags, &size);
 	  break;
 
@@ -511,6 +525,7 @@ fcntl_internal (int fd, int cmd, va_list ap)
 	    rv = flags;
 	  break;
 	case F_SETFD:
+	  flags = va_arg (ap, int);
 	  /* TODO handle this */
 	  LDBG (0, "F_SETFD ignored flags %u", flags);
 	  rv = 0;
@@ -583,13 +598,22 @@ ioctl (int fd, unsigned long int cmd, ...)
       switch (cmd)
 	{
 	case FIONREAD:
-	  rv = vls_attr (vlsh, VPPCOM_ATTR_GET_NREAD, 0, 0);
+	  {
+	    int *nread = va_arg (ap, int *);
+	    if (!nread)
+	      rv = -EFAULT;
+	    else if ((rv = vls_attr (vlsh, VPPCOM_ATTR_GET_NREAD, 0, 0)) >= 0)
+	      {
+		*nread = rv;
+		rv = 0;
+	      }
+	  }
 	  break;
 	case TIOCOUTQ:
 	  {
 	    u32 *buf = va_arg (ap, void *);
-	    u32 *buflen = va_arg (ap, u32 *);
-	    rv = vls_attr (vlsh, VPPCOM_ATTR_GET_NWRITEQ, buf, buflen);
+	    u32 buflen = sizeof (*buf);
+	    rv = buf ? vls_attr (vlsh, VPPCOM_ATTR_GET_NWRITEQ, buf, &buflen) : -EFAULT;
 	  }
 	  break;
 	case FIONBIO:
@@ -605,6 +629,32 @@ ioctl (int fd, unsigned long int cmd, ...)
 	  }
 	  break;
 
+	/* Interface discovery is control-plane metadata. libtorrent uses a
+	 * datagram descriptor for these queries even though no packet is sent.
+	 * Keep this whitelist query-only; never pass a data operation here. */
+	case SIOCGIFCONF:
+	case SIOCGIFADDR:
+	case SIOCGIFNETMASK:
+	case SIOCGIFBRDADDR:
+	case SIOCGIFDSTADDR:
+	case SIOCGIFFLAGS:
+	case SIOCGIFMTU:
+	case SIOCGIFINDEX:
+	case SIOCGIFNAME:
+	case SIOCGIFHWADDR:
+	  {
+	    int metadata_fd = libc_socket (AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	    if (metadata_fd < 0)
+	      rv = -errno;
+	    else
+	      {
+		rv = libc_vioctl (metadata_fd, cmd, ap);
+		if (rv < 0)
+		  rv = -errno;
+		libc_close (metadata_fd);
+	      }
+	  }
+	  break;
 	default:
 	  rv = -EOPNOTSUPP;
 	  break;
@@ -1022,6 +1072,17 @@ socket (int domain, int type, int protocol)
 	    {
 	      if (assign_cert_key_pair (vlsh) < 0)
 		return -1;
+	    }
+	  /* Record the family before bind/connect, as Linux socket() does. */
+	  u8 ip[16] = { 0 };
+	  vppcom_endpt_t ep = { .is_ip4 = domain == AF_INET, .ip = ip };
+	  u32 ep_len = sizeof (ep);
+	  rv = vls_attr (vlsh, VPPCOM_ATTR_SET_LCL_ADDR, &ep, &ep_len);
+	  if (rv)
+	    {
+	      vls_close (vlsh);
+	      errno = -rv;
+	      return -1;
 	    }
 	  rv = ldp_vlsh_to_fd (vlsh);
 	}
@@ -1532,9 +1593,6 @@ recv (int fd, void *buf, size_t n, int flags)
 
   vlsh = ldp_fd_to_vlsh (fd);
 
-  /* Strip ignorable flags */
-  flags &= ~(MSG_DONTWAIT | MSG_NOSIGNAL);
-
   if (vlsh != VLS_INVALID_HANDLE)
     {
       size = vls_recvfrom (vlsh, buf, n, flags, NULL);
@@ -1593,7 +1651,7 @@ ldp_vls_sendo (vls_handle_t vlsh, const void *buf, size_t n,
 	  break;
 
 	default:
-	  return EAFNOSUPPORT;
+	  return -EAFNOSUPPORT;
 	}
     }
 
@@ -1609,9 +1667,6 @@ ldp_vls_recvfrom (vls_handle_t vlsh, void *__restrict buf, size_t n, int flags,
   vppcom_endpt_t ep;
   ssize_t size;
   int rv;
-
-  /* Strip ignorable flags */
-  flags &= ~(MSG_DONTWAIT | MSG_NOSIGNAL);
 
   if (addr)
     {
@@ -1748,33 +1803,30 @@ ldp_make_cmsg (vls_handle_t vlsh, struct msghdr *msg)
 {
   u32 optval, optlen = sizeof (optval);
   struct cmsghdr *cmsg;
+  vppcom_endpt_t ep = { 0 };
+  u8 addr_buf[16];
+  u32 size = sizeof (ep);
+  size_t capacity = msg->msg_controllen;
 
-  cmsg = CMSG_FIRSTHDR (msg);
-  memset (cmsg, 0, sizeof (*cmsg));
-
-  if (!vls_attr (vlsh, VPPCOM_ATTR_GET_IP_PKTINFO, (void *) &optval, &optlen))
+  msg->msg_controllen = 0;
+  if (vls_attr (vlsh, VPPCOM_ATTR_GET_IP_PKTINFO, &optval, &optlen) || !optval)
     return 0;
-
-  if (optval)
+  ep.ip = addr_buf;
+  if (vls_attr (vlsh, VPPCOM_ATTR_GET_LCL_ADDR, &ep, &size) || !ep.is_ip4)
+    return 0;
+  if (!msg->msg_control || capacity < CMSG_SPACE (sizeof (struct in_pktinfo)))
     {
-      vppcom_endpt_t ep;
-      u8 addr_buf[sizeof (struct in_addr)];
-      u32 size = sizeof (ep);
-
-      ep.ip = addr_buf;
-
-      if (!vls_attr (vlsh, VPPCOM_ATTR_GET_LCL_ADDR, &ep, &size))
-	{
-	  struct in_pktinfo pi = {};
-
-	  clib_memcpy (&pi.ipi_addr, ep.ip, sizeof (struct in_addr));
-	  cmsg->cmsg_level = SOL_IP;
-	  cmsg->cmsg_type = IP_PKTINFO;
-	  cmsg->cmsg_len = CMSG_LEN (sizeof (pi));
-	  clib_memcpy (CMSG_DATA (cmsg), &pi, sizeof (pi));
-	}
+      msg->msg_flags |= MSG_CTRUNC;
+      return 0;
     }
-
+  msg->msg_controllen = CMSG_SPACE (sizeof (struct in_pktinfo));
+  cmsg = CMSG_FIRSTHDR (msg);
+  memset (cmsg, 0, msg->msg_controllen);
+  cmsg->cmsg_level = SOL_IP;
+  cmsg->cmsg_type = IP_PKTINFO;
+  cmsg->cmsg_len = CMSG_LEN (sizeof (struct in_pktinfo));
+  struct in_pktinfo *pi = (void *) CMSG_DATA (cmsg);
+  clib_memcpy_fast (&pi->ipi_addr, ep.ip, sizeof (struct in_addr));
   return 0;
 }
 
@@ -1794,7 +1846,48 @@ sendmsg (int fd, const struct msghdr * msg, int flags)
       ssize_t total = 0;
       int i, rv = 0;
 
+      int proto;
+      u32 proto_len = sizeof (proto);
+      rv = vls_attr (vlsh, VPPCOM_ATTR_GET_PROTOCOL, &proto, &proto_len);
+      if (rv < 0)
+	{
+	  errno = -rv;
+	  return -1;
+	}
       ldp_parse_cmsg (vlsh, msg, &app_tlvs);
+
+      /* A scatter/gather UDP send is one datagram, never one per iovec. */
+      if (proto == VPPCOM_PROTO_UDP && msg->msg_iovlen > 1)
+	{
+	  ldp_worker_ctx_t *ldpw = ldp_worker_get_current ();
+	  size_t len = 0, offset = 0;
+	  for (i = 0; i < msg->msg_iovlen; i++)
+	    {
+	      if (iov[i].iov_len > 65507 - len)
+		{
+		  vec_free (app_tlvs);
+		  errno = EMSGSIZE;
+		  return -1;
+		}
+	      len += iov[i].iov_len;
+	    }
+	  vec_validate (ldpw->dgram_buffer, len ? len - 1 : 0);
+	  for (i = 0; i < msg->msg_iovlen; i++)
+	    {
+	      if (iov[i].iov_len)
+		clib_memcpy_fast (ldpw->dgram_buffer + offset, iov[i].iov_base, iov[i].iov_len);
+	      offset += iov[i].iov_len;
+	    }
+	  rv = ldp_vls_sendo (vlsh, ldpw->dgram_buffer, len, app_tlvs, flags, msg->msg_name,
+			      msg->msg_namelen);
+	  vec_free (app_tlvs);
+	  if (rv < 0)
+	    {
+	      errno = -rv;
+	      return -1;
+	    }
+	  return rv;
+	}
 
       for (i = 0; i < msg->msg_iovlen; ++i)
 	{
@@ -1886,15 +1979,50 @@ recvmsg (int fd, struct msghdr * msg, int flags)
   if (vlsh != VLS_INVALID_HANDLE)
     {
       struct iovec *iov = msg->msg_iov;
+      msg->msg_flags = 0;
       ssize_t max_deq, total = 0;
       int i, rv = 0;
 
+      int proto;
+      u32 proto_len = sizeof (proto);
+      rv = vls_attr (vlsh, VPPCOM_ATTR_GET_PROTOCOL, &proto, &proto_len);
+      if (rv < 0)
+	{
+	  errno = -rv;
+	  return -1;
+	}
+      if (proto == VPPCOM_PROTO_UDP)
+	{
+	  ldp_worker_ctx_t *ldpw = ldp_worker_get_current ();
+	  size_t copied = 0;
+	  vec_validate (ldpw->dgram_buffer, 65535);
+	  rv = ldp_vls_recvfrom (vlsh, ldpw->dgram_buffer, 65536, flags & ~MSG_TRUNC, msg->msg_name,
+				 &msg->msg_namelen);
+	  if (rv < 0)
+	    {
+	      errno = -rv;
+	      return -1;
+	    }
+	  for (i = 0; i < msg->msg_iovlen && copied < rv; i++)
+	    {
+	      size_t len = clib_min (iov[i].iov_len, rv - copied);
+	      if (len)
+		clib_memcpy_fast (iov[i].iov_base, ldpw->dgram_buffer + copied, len);
+	      copied += len;
+	    }
+	  msg->msg_flags = copied < rv ? MSG_TRUNC : 0;
+	  /* No ancillary data is generated unless requested below. */
+	  if (msg->msg_controllen)
+	    ldp_make_cmsg (vlsh, msg);
+	  return flags & MSG_TRUNC ? rv : copied;
+	}
+
       max_deq = vls_attr (vlsh, VPPCOM_ATTR_GET_NREAD, 0, 0);
-      if (!max_deq)
-	return 0;
 
       for (i = 0; i < msg->msg_iovlen; i++)
 	{
+	  if (!iov[i].iov_len)
+	    continue;
 	  rv = ldp_vls_recvfrom (vlsh, iov[i].iov_base, iov[i].iov_len, flags,
 				 (i == 0 ? msg->msg_name : NULL),
 				 (i == 0 ? &msg->msg_namelen : NULL));
@@ -2085,16 +2213,24 @@ getsockopt (int fd, int level, int optname,
 	      rv = vls_attr (vlsh, VPPCOM_ATTR_GET_KEEPALIVE, optval, optlen);
 	      break;
 	    case SO_PROTOCOL:
+	    case SO_TYPE:
 	      rv = vls_attr (vlsh, VPPCOM_ATTR_GET_PROTOCOL, optval, optlen);
-	      *(int *) optval = *(int *) optval ? SOCK_DGRAM : SOCK_STREAM;
+	      if (!rv)
+		{
+		  int udp = *(int *) optval == VPPCOM_PROTO_UDP;
+		  *(int *) optval = optname == SO_TYPE ? (udp ? SOCK_DGRAM : SOCK_STREAM) :
+							 (udp ? IPPROTO_UDP : IPPROTO_TCP);
+		}
 	      break;
 	    case SO_SNDBUF:
-	      rv = vls_attr (vlsh, VPPCOM_ATTR_GET_TX_FIFO_LEN,
-			     optval, optlen);
-	      break;
 	    case SO_RCVBUF:
-	      rv = vls_attr (vlsh, VPPCOM_ATTR_GET_RX_FIFO_LEN,
+	      rv = vls_attr (vlsh,
+			     optname == SO_SNDBUF ? VPPCOM_ATTR_GET_TX_FIFO_LEN :
+						    VPPCOM_ATTR_GET_RX_FIFO_LEN,
 			     optval, optlen);
+	      /* Linux reports twice the requested size. Boost.Asio halves it. */
+	      if (!rv)
+		*(int *) optval = 2 * clib_min (*(u32 *) optval, INT_MAX / 2);
 	      break;
 	    case SO_REUSEADDR:
 	      rv = vls_attr (vlsh, VPPCOM_ATTR_GET_REUSEADDR, optval, optlen);
@@ -2203,6 +2339,22 @@ setsockopt (int fd, int level, int optname,
 	case SOL_SOCKET:
 	  switch (optname)
 	    {
+	    case SO_SNDBUF:
+	    case SO_RCVBUF:
+	      if (!optval)
+		rv = -EFAULT;
+	      else if (optlen < sizeof (int) || *(const int *) optval < 0)
+		rv = -EINVAL;
+	      else
+		{
+		  u32 value = clib_max (1, clib_min (*(const int *) optval, INT_MAX / 2));
+		  u32 size = sizeof (value);
+		  rv = vls_attr (vlsh,
+				 optname == SO_SNDBUF ? VPPCOM_ATTR_SET_TX_FIFO_LEN :
+							VPPCOM_ATTR_SET_RX_FIFO_LEN,
+				 &value, &size);
+		}
+	      break;
 	    case SO_KEEPALIVE:
 	      rv = vls_attr (vlsh, VPPCOM_ATTR_SET_KEEPALIVE,
 			     (void *) optval, &optlen);
@@ -2675,7 +2827,7 @@ epoll_again:
     libc_epoll_pwait (libc_epfd, libc_evts, maxevents, timeout, sigmask);
   if (libc_num_ev <= 0)
     {
-      rv = rv >= 0 ? rv : -1;
+      rv = rv ? rv : libc_num_ev;
       goto done;
     }
 
@@ -2727,39 +2879,65 @@ epoll_wait (int epfd, struct epoll_event *events, int maxevents, int timeout)
     return ldp_epoll_pwait (epfd, events, maxevents, timeout, NULL);
 }
 
-int
-poll (struct pollfd *fds, nfds_t nfds, int timeout)
+static int
+ldp_poll (struct pollfd *fds, nfds_t nfds, const struct timespec *timeout, const sigset_t *sigmask)
 {
-  int rv, i, n_revents = 0;
+  int rv, n_revents = 0;
+  nfds_t i;
   ldp_worker_ctx_t *ldpw;
   vls_handle_t vlsh;
   vcl_poll_t *vp;
-  double max_time;
+  double max_time = 0;
+#ifdef _GNU_SOURCE
+  const struct timespec nowait = { 0, 0 };
+  struct timespec wait_slice;
+#endif
 
   ldp_init_check ();
+
+  if ((!fds && nfds) ||
+      (timeout && (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000)))
+    {
+      errno = !fds && nfds ? EFAULT : EINVAL;
+      return -1;
+    }
+
+  /* Qt's event loop usually contains only kernel eventfds and pipes. Do not
+   * turn that blocking wait into a busy loop. No network socket is created. */
+  for (i = 0; i < nfds; i++)
+    if (ldp_fd_to_vlsh (fds[i].fd) != VLS_INVALID_HANDLE)
+      break;
+  if (i == nfds)
+    {
+#ifdef _GNU_SOURCE
+      return libc_ppoll (fds, nfds, timeout, sigmask);
+#else
+      return libc_poll (
+	fds, nfds,
+	timeout ? clib_min ((double) timeout->tv_sec * 1000 + (timeout->tv_nsec + 999999) / 1000000,
+			    INT_MAX) :
+		  -1);
+#endif
+    }
 
   if (PREDICT_FALSE (vppcom_worker_index () == ~0))
     vls_register_vcl_worker ();
 
   ldpw = ldp_worker_get_current ();
-
-  LDBG (3, "fds %p, nfds %ld, timeout %d", fds, nfds, timeout);
-
   if (PREDICT_FALSE (ldpw->clib_time.init_cpu_time == 0))
     clib_time_init (&ldpw->clib_time);
-
-  max_time = (timeout >= 0) ? (f64) timeout / 1000 : 0;
-  max_time += clib_time_now (&ldpw->clib_time);
+  if (timeout)
+    max_time = clib_time_now (&ldpw->clib_time) + timeout->tv_sec + (double) timeout->tv_nsec / 1e9;
 
   for (i = 0; i < nfds; i++)
     {
+      fds[i].revents = 0;
       if (fds[i].fd < 0)
 	continue;
 
       vlsh = ldp_fd_to_vlsh (fds[i].fd);
       if (vlsh != VLS_INVALID_HANDLE)
 	{
-	  fds[i].fd = -fds[i].fd;
 	  vec_add2 (ldpw->vcl_poll, vp, 1);
 	  vp->fds_ndx = i;
 	  vp->sh = vlsh_to_sh (vlsh);
@@ -2770,7 +2948,7 @@ poll (struct pollfd *fds, nfds_t nfds, int timeout)
 	  if (fds[i].events & POLLWRNORM)
 	    vp->events |= POLLOUT;
 #endif
-	  vp->revents = fds[i].revents;
+	  vp->revents = 0;
 	}
       else
 	{
@@ -2781,75 +2959,80 @@ poll (struct pollfd *fds, nfds_t nfds, int timeout)
 
   do
     {
-      if (vec_len (ldpw->vcl_poll))
+      rv = vls_poll (ldpw->vcl_poll, vec_len (ldpw->vcl_poll), 0);
+      if (rv < 0)
 	{
-	  rv = vls_poll (ldpw->vcl_poll, vec_len (ldpw->vcl_poll), 0);
-	  if (rv < 0)
-	    {
-	      errno = -rv;
-	      rv = -1;
-	      goto done;
-	    }
-	  else
-	    n_revents += rv;
+	  errno = -rv;
+	  rv = -1;
+	  goto done;
 	}
+      /* poll returns the number of descriptors, not the number of events. */
+      n_revents = 0;
+      vec_foreach (vp, ldpw->vcl_poll)
+	n_revents += vp->revents != 0;
 
-      if (vec_len (ldpw->libc_poll))
+#ifdef _GNU_SOURCE
+      /* Qt mixes VCL listeners with kernel timers/pipes. Bound the wait
+       * between VCL readiness checks instead of spinning an idle CPU. Peers
+       * using epoll retain the VCL eventfd notification path. */
+      wait_slice = (struct timespec) { 0, 1000000 };
+      if (timeout)
 	{
-	  rv = libc_poll (ldpw->libc_poll, vec_len (ldpw->libc_poll), 0);
-	  if (rv < 0)
-	    goto done;
-	  else
-	    n_revents += rv;
+	  double left = max_time - clib_time_now (&ldpw->clib_time);
+	  wait_slice.tv_nsec = left <= 0 ? 0 : clib_min (left * 1e9, 1000000);
 	}
-
+      rv = libc_ppoll (ldpw->libc_poll, vec_len (ldpw->libc_poll),
+		       n_revents ? &nowait : &wait_slice, sigmask);
+#else
+      rv = libc_poll (ldpw->libc_poll, vec_len (ldpw->libc_poll), 0);
+#endif
+      if (rv < 0)
+	goto done;
+      n_revents += rv;
       if (n_revents)
 	{
 	  rv = n_revents;
 	  goto done;
 	}
     }
-  while ((timeout < 0) || (clib_time_now (&ldpw->clib_time) < max_time));
+  while (!timeout || clib_time_now (&ldpw->clib_time) < max_time);
   rv = 0;
 
 done:
   vec_foreach (vp, ldpw->vcl_poll)
-  {
-    fds[vp->fds_ndx].fd = -fds[vp->fds_ndx].fd;
-    fds[vp->fds_ndx].revents = vp->revents;
-#ifdef __USE_XOPEN2K
-    if ((fds[vp->fds_ndx].revents & POLLIN) &&
-	(fds[vp->fds_ndx].events & POLLRDNORM))
-      fds[vp->fds_ndx].revents |= POLLRDNORM;
-    if ((fds[vp->fds_ndx].revents & POLLOUT) &&
-	(fds[vp->fds_ndx].events & POLLWRNORM))
-      fds[vp->fds_ndx].revents |= POLLWRNORM;
-#endif
-  }
-  vec_reset_length (ldpw->vcl_poll);
-
-  for (i = 0; i < vec_len (ldpw->libc_poll); i++)
     {
-      fds[ldpw->libc_poll_idxs[i]].revents = ldpw->libc_poll[i].revents;
+      fds[vp->fds_ndx].revents = vp->revents;
+#ifdef __USE_XOPEN2K
+      if ((vp->revents & POLLIN) && (fds[vp->fds_ndx].events & POLLRDNORM))
+	fds[vp->fds_ndx].revents |= POLLRDNORM;
+      if ((vp->revents & POLLOUT) && (fds[vp->fds_ndx].events & POLLWRNORM))
+	fds[vp->fds_ndx].revents |= POLLWRNORM;
+#endif
     }
+  vec_reset_length (ldpw->vcl_poll);
+  for (i = 0; i < vec_len (ldpw->libc_poll); i++)
+    fds[ldpw->libc_poll_idxs[i]].revents = ldpw->libc_poll[i].revents;
   vec_reset_length (ldpw->libc_poll_idxs);
   vec_reset_length (ldpw->libc_poll);
-
   return rv;
+}
+
+int
+poll (struct pollfd *fds, nfds_t nfds, int timeout)
+{
+  struct timespec ts;
+  if (timeout < 0)
+    return ldp_poll (fds, nfds, NULL, NULL);
+  ts.tv_sec = timeout / 1000;
+  ts.tv_nsec = (timeout % 1000) * 1000000;
+  return ldp_poll (fds, nfds, &ts, NULL);
 }
 
 #ifdef _GNU_SOURCE
 int
-ppoll (struct pollfd *fds, nfds_t nfds,
-       const struct timespec *timeout, const sigset_t * sigmask)
+ppoll (struct pollfd *fds, nfds_t nfds, const struct timespec *timeout, const sigset_t *sigmask)
 {
-  ldp_init_check ();
-
-  clib_warning ("LDP<%d>: LDP-TBD", getpid ());
-  errno = ENOSYS;
-
-
-  return -1;
+  return ldp_poll (fds, nfds, timeout, sigmask);
 }
 #endif
 

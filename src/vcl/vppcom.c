@@ -1426,11 +1426,18 @@ vppcom_session_unbind (u32 session_handle)
   /* Flush pending accept events, if any */
   while (clib_fifo_elts (session->accept_evts_fifo))
     {
+      svm_msg_q_t *evt_q = 0;
       clib_fifo_sub2 (session->accept_evts_fifo, evt);
       accepted_msg = &evt->accepted_msg;
       vcl_session_table_del_vpp_handle (wrk, accepted_msg->handle);
-      vcl_send_session_accepted_reply (session->vpp_evt_q, accepted_msg, 0,
-				       SESSION_E_REFUSED);
+      /* A TCP listener has no data FIFO/event queue. Each pending accept
+       * belongs to the transport worker carried in its notification. */
+      vcl_segment_attach_mq (vcl_vpp_worker_segment_handle (0),
+			     accepted_msg->vpp_event_queue_address, accepted_msg->mq_index, &evt_q);
+      if (evt_q)
+	vcl_send_session_accepted_reply (evt_q, accepted_msg, 0, SESSION_E_REFUSED);
+      else
+	VWRN ("cannot reject pending accept 0x%llx: event queue unavailable", accepted_msg->handle);
     }
   clib_fifo_free (session->accept_evts_fifo);
 
@@ -2284,8 +2291,7 @@ vppcom_session_stream_connect (uint32_t session_handle,
 }
 
 static inline int
-vppcom_session_read_internal (uint32_t session_handle, void *buf, int n,
-			      u8 peek)
+vppcom_session_read_internal (uint32_t session_handle, void *buf, int n, u8 peek, int flags)
 {
   vcl_worker_t *wrk = vcl_worker_get_current ();
   int rv, n_read = 0, is_nonblocking;
@@ -2322,7 +2328,7 @@ vppcom_session_read_internal (uint32_t session_handle, void *buf, int n,
 	}
     }
 
-  is_nonblocking = vcl_session_has_attr (s, VCL_SESS_ATTR_NONBLOCK);
+  is_nonblocking = vcl_session_has_attr (s, VCL_SESS_ATTR_NONBLOCK) || (flags & MSG_DONTWAIT);
   rx_fifo = s->rx_fifo;
   s->flags &= ~VCL_SESSION_F_HAS_RX_EVT;
 
@@ -2415,14 +2421,9 @@ read_again:
 int
 vppcom_session_read (uint32_t session_handle, void *buf, size_t n)
 {
-  return (vppcom_session_read_internal (session_handle, buf, n, 0));
+  return (vppcom_session_read_internal (session_handle, buf, n, 0, 0));
 }
 
-static int
-vppcom_session_peek (uint32_t session_handle, void *buf, int n)
-{
-  return (vppcom_session_read_internal (session_handle, buf, n, 1));
-}
 
 int
 vppcom_session_read_segments (uint32_t session_handle,
@@ -2518,8 +2519,8 @@ vcl_fifo_is_writeable (svm_fifo_t * f, u32 len, u8 is_dgram)
 }
 
 always_inline int
-vppcom_session_write_inline (vcl_worker_t *wrk, vcl_session_t *s, void *buf,
-			     size_t n, u8 is_flush, u8 is_dgram)
+vppcom_session_write_inline (vcl_worker_t *wrk, vcl_session_t *s, void *buf, size_t n, u8 is_flush,
+			     u8 is_dgram, int flags)
 {
   int n_write, is_nonblocking;
   session_evt_type_t et;
@@ -2556,7 +2557,7 @@ vppcom_session_write_inline (vcl_worker_t *wrk, vcl_session_t *s, void *buf,
     }
 
   tx_fifo = s->tx_fifo;
-  is_nonblocking = vcl_session_has_attr (s, VCL_SESS_ATTR_NONBLOCK);
+  is_nonblocking = vcl_session_has_attr (s, VCL_SESS_ATTR_NONBLOCK) || (flags & MSG_DONTWAIT);
 
   if (!vcl_fifo_is_writeable (tx_fifo, n, is_dgram))
     {
@@ -2685,8 +2686,7 @@ vppcom_session_write (uint32_t session_handle, void *buf, size_t n)
   if (PREDICT_FALSE (!s))
     return VPPCOM_EBADFD;
 
-  return vppcom_session_write_inline (wrk, s, buf, n, 0 /* is_flush */,
-				      s->is_dgram ? 1 : 0);
+  return vppcom_session_write_inline (wrk, s, buf, n, 0 /* is_flush */, s->is_dgram ? 1 : 0, 0);
 }
 
 int
@@ -2699,8 +2699,7 @@ vppcom_session_write_msg (uint32_t session_handle, void *buf, size_t n)
   if (PREDICT_FALSE (!s))
     return VPPCOM_EBADFD;
 
-  return vppcom_session_write_inline (wrk, s, buf, n, 1 /* is_flush */,
-				      s->is_dgram ? 1 : 0);
+  return vppcom_session_write_inline (wrk, s, buf, n, 1 /* is_flush */, s->is_dgram ? 1 : 0, 0);
 }
 
 #define vcl_fifo_rx_evt_valid_or_break(_s)                                    \
@@ -4161,7 +4160,8 @@ vppcom_session_attr (uint32_t session_handle, uint32_t op,
     case VPPCOM_ATTR_GET_ERROR:
       if (buffer && buflen && (*buflen >= sizeof (int)))
 	{
-	  *(int *) buffer = 0;
+	  *(int *) buffer = -vppcom_session_get_error (session_handle);
+	  session->vpp_error = SESSION_E_NONE;
 	  *buflen = sizeof (int);
 
 	  VDBG (2, "VPPCOM_ATTR_GET_ERROR: %d, buflen %d, #VPP-TBD#",
@@ -4181,9 +4181,10 @@ vppcom_session_attr (uint32_t session_handle, uint32_t op,
 				    vcm->cfg.tx_fifo_size);
 	  *buflen = sizeof (u32);
 
-	  VDBG (2, "VPPCOM_ATTR_GET_TX_FIFO_LEN: %u (0x%x), buflen %d,"
-		" #VPP-TBD#", *(size_t *) buffer, *(size_t *) buffer,
-		*buflen);
+	  VDBG (2,
+		"VPPCOM_ATTR_GET_TX_FIFO_LEN: %u (0x%x), buflen %d,"
+		" #VPP-TBD#",
+		*(u32 *) buffer, *(u32 *) buffer, *buflen);
 	}
       else
 	rv = VPPCOM_EINVAL;
@@ -4219,14 +4220,15 @@ vppcom_session_attr (uint32_t session_handle, uint32_t op,
 	{
 
 	  /* VPP-TBD */
-	  *(size_t *) buffer = (session->rcvbuf_size ? session->rcvbuf_size :
-				session->rx_fifo ?
-				svm_fifo_size (session->rx_fifo) :
-				vcm->cfg.rx_fifo_size);
+	  *(u32 *) buffer = (session->rcvbuf_size ? session->rcvbuf_size :
+			     session->rx_fifo	  ? svm_fifo_size (session->rx_fifo) :
+						    vcm->cfg.rx_fifo_size);
 	  *buflen = sizeof (u32);
 
-	  VDBG (2, "VPPCOM_ATTR_GET_RX_FIFO_LEN: %u (0x%x), buflen %d, "
-		"#VPP-TBD#", *(size_t *) buffer, *(size_t *) buffer, *buflen);
+	  VDBG (2,
+		"VPPCOM_ATTR_GET_RX_FIFO_LEN: %u (0x%x), buflen %d, "
+		"#VPP-TBD#",
+		*(u32 *) buffer, *(u32 *) buffer, *buflen);
 	}
       else
 	rv = VPPCOM_EINVAL;
@@ -4757,15 +4759,10 @@ vppcom_session_recvfrom (uint32_t session_handle, void *buffer,
   vcl_session_t *session;
   int rv = VPPCOM_OK;
 
-  if (flags == 0)
-    rv = vppcom_session_read (session_handle, buffer, buflen);
-  else if (flags & MSG_PEEK)
-    rv = vppcom_session_peek (session_handle, buffer, buflen);
-  else
-    {
-      VDBG (0, "Unsupport flags for recvfrom %d", flags);
-      return VPPCOM_EAFNOSUPPORT;
-    }
+  if (flags & ~(MSG_PEEK | MSG_DONTWAIT | MSG_NOSIGNAL))
+    return -EOPNOTSUPP;
+
+  rv = vppcom_session_read_internal (session_handle, buffer, buflen, !!(flags & MSG_PEEK), flags);
 
   if (ep && rv > 0)
     {
@@ -4862,14 +4859,10 @@ vppcom_session_sendto (uint32_t session_handle, void *buffer,
 	}
     }
 
-  if (flags)
-    {
-      // TBD check the flags and do the right thing
-      VDBG (2, "handling flags 0x%u (%d) not implemented yet.", flags, flags);
-    }
+  if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE))
+    return -EOPNOTSUPP;
 
-  return (vppcom_session_write_inline (wrk, s, buffer, buflen, 1,
-				       s->is_dgram ? 1 : 0));
+  return (vppcom_session_write_inline (wrk, s, buffer, buflen, 1, s->is_dgram ? 1 : 0, flags));
 }
 
 int
@@ -4891,18 +4884,27 @@ vppcom_poll (vcl_poll_t * vp, uint32_t n_sids, double wait_for_time)
     {
       vcl_session_t *session;
 
-      /* Dequeue all events and drop all unhandled io events */
+      /* Poll and epoll may share a VLS worker (Qt and Boost.Asio).
+       * Process control messages, but preserve events owned by epoll. */
       while (svm_msg_q_sub (wrk->app_event_queue, &msg, SVM_Q_NOWAIT, 0) == 0)
 	{
 	  e = svm_msg_q_msg_data (wrk->app_event_queue, &msg);
 	  vcl_handle_mq_event (wrk, e);
 	  svm_msg_q_free_msg (wrk->app_event_queue, &msg);
 	}
-      vec_reset_length (wrk->unhandled_evts_vector);
+      u32 n_pending = 0;
+      vec_foreach (e, wrk->unhandled_evts_vector)
+	{
+	  session = vcl_session_get (wrk, e->session_index);
+	  if (session && (session->flags & VCL_SESSION_F_IS_VEP_SESSION))
+	    wrk->unhandled_evts_vector[n_pending++] = *e;
+	}
+      if (wrk->unhandled_evts_vector)
+	vec_set_len (wrk->unhandled_evts_vector, n_pending);
 
       for (i = 0; i < n_sids; i++)
 	{
-	  session = vcl_session_get (wrk, vp[i].sh);
+	  session = vcl_session_get_w_handle (wrk, vp[i].sh);
 	  if (!session)
 	    {
 	      vp[i].revents = POLLHUP;
@@ -4911,6 +4913,11 @@ vppcom_poll (vcl_poll_t * vp, uint32_t n_sids, double wait_for_time)
 	    }
 
 	  vp[i].revents = 0;
+
+	  /* A nonblocking connect has no FIFOs until the connected reply.
+	   * ENOTCONN from read_ready is not a connection failure here. */
+	  if (session->session_state == VCL_STATE_UPDATED)
+	    continue;
 
 	  if (POLLIN & vp[i].events)
 	    {

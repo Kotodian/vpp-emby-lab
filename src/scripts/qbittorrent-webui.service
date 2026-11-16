@@ -2,7 +2,9 @@
 Description=Local qBittorrent WebUI proxy to VPP
 After=qbittorrent.service qbittorrent-webui.socket
 Requires=qbittorrent-webui.socket
-BindsTo=qbittorrent.service
+# Socket activation must not restart qbit (or pull VPP back up) after a fault.
+Requisite=qbittorrent.service
+PartOf=qbittorrent.service
 
 [Service]
 ExecStart=/usr/local/sbin/qbittorrent-webui-proxy.sh

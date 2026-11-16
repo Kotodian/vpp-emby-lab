@@ -83,6 +83,12 @@ if(VPP_BUILD_VCL_TESTS)
     ENABLE_EXPORTS
     NO_INSTALL
   )
+  add_vpp_test(vcl_locked_mt_test
+    SOURCES test_locked.c
+    LINK_LIBRARIES vppcom vppinfra svm dl pthread
+    ENABLE_EXPORTS
+    NO_INSTALL
+  )
 endif()
 endif()
 

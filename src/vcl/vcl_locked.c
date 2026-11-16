@@ -1194,6 +1194,10 @@ vls_mt_acq_locks (vcl_locked_session_t *vls, vls_mt_ops_t op)
       vls_mt_spool_rlock ();
       break;
     case VLS_MT_OP_SPOOL:
+      /* Pool operations such as accept can wait for control replies. The
+       * wait hooks release/reacquire the MQ lock, so it must be owned here
+       * too, in the same MQ-before-spool order used by polling. */
+      vls_mt_mq_lock ();
       vls_mt_spool_wlock ();
       break;
     default:
@@ -2248,16 +2252,22 @@ vls_mt_mq_wait_lock (vcl_session_handle_t vcl_sh)
 static inline void
 vls_mt_mq_wait_unlock (vcl_session_handle_t vcl_sh)
 {
+  u8 was_writer;
+
   if (vls_mt_wrk_supported () || !vlsl->vls_mt_needs_locks)
     return;
 
-  vls_mt_spool_runlock ();
+  was_writer = !!(vlspt->locks_acq & VLS_MT_WLOCK_SPOOL);
+  vls_mt_spool_unlock ();
 
   /* No locks should be taken by pthread at this point. So writers to spool,
    * which were blocked until now, should be able to proceed */
 
   vls_mt_mq_lock ();
-  vls_mt_spool_rlock ();
+  if (was_writer)
+    vls_mt_spool_wlock ();
+  else
+    vls_mt_spool_rlock ();
 }
 
 int

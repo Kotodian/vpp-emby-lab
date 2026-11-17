@@ -1439,6 +1439,12 @@ add_vpp_library(vnet
 )
 unset(_vnet_library_visibility)
 
+add_vpp_test(session_udp_tx_test
+  SOURCES session/test_udp_tx.c
+  LINK_LIBRARIES svm vppinfra
+  NO_INSTALL
+)
+
 ##############################################################################
 # vpp api test client library
 ##############################################################################

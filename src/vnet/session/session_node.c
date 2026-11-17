@@ -13,6 +13,7 @@
 #include <vnet/session/application_interface.h>
 #include <vnet/session/application_local.h>
 #include <vnet/session/session_debug.h>
+#include <vnet/session/session_tx.h>
 #include <svm/queue.h>
 #include <sys/timerfd.h>
 
@@ -1341,6 +1342,26 @@ session_tx_set_dequeue_params (vlib_main_t * vm, session_tx_context_t * ctx,
 	    }
 	  ASSERT (ctx->hdr.data_length > ctx->hdr.data_offset);
 	  len = ctx->hdr.data_length - ctx->hdr.data_offset;
+
+	  /* A UDP socket can alternate short ACKs and full-size payloads.
+	   * Batch complete unsegmented messages independently of their size;
+	   * session_tx_fill_buffer retains each message's endpoint header. */
+	  chain_limit = clib_min (n_bytes_per_buf - TRANSPORT_MAX_HDRS_LEN, ctx->sp.snd_mss);
+	  if (!ctx->hdr.data_offset && !ctx->hdr.gso_size && len <= chain_limit)
+	    {
+	      u32 payload_bytes, n_dgrams;
+	      n_dgrams =
+		session_tx_plan_dgrams (ctx->s->tx_fifo, clib_min (ctx->max_dequeue, 32 << 10),
+					max_segs, chain_limit, ctx->sp.snd_space, &payload_bytes);
+	      if (n_dgrams)
+		{
+		  ctx->max_dequeue = ctx->max_len_to_snd = payload_bytes;
+		  ctx->n_segs_per_evt = ctx->n_bufs_needed = n_dgrams;
+		  ctx->n_bufs_per_seg = 1;
+		  ctx->deq_per_buf = ctx->deq_per_first_buf = chain_limit;
+		  return;
+		}
+	    }
 	  ctx->sp.snd_mss = clib_min (ctx->sp.snd_mss, len);
 
 	  if (ctx->hdr.gso_size)

@@ -1994,6 +1994,17 @@ tcp_test_bbr (vlib_main_t *vm, unformat_input_t *input)
       return -1;
     }
 
+  /* Half-open connections have selected BBR but do not own a BBR pool
+   * entry yet. Formatting must not dereference worker state in that phase. */
+  clib_memset (tc, 0, sizeof (*tc));
+  tc->state = TCP_STATE_SYN_SENT;
+  tc->c_thread_index = (clib_thread_index_t) ~0;
+  tc->cc_algo = tcp_cc_algo_get (TCP_CC_BBR);
+  state = format (0, "%U%c", tc->cc_algo->format, tc, 0);
+  TCP_TEST (strstr ((char *) state, "not initialized") != 0,
+	    "bbr formats a half-open connection without pool state: %s", state);
+  vec_free (state);
+
   /* The model quantum is independent of the transport pacer's burst size. */
   tcp_test_set_time (thread_index, 1);
   tcp_test_bbr_init (tc, thread_index, 536, 0.1);
@@ -2005,6 +2016,10 @@ tcp_test_bbr (vlib_main_t *vm, unformat_input_t *input)
   TCP_TEST (bbr_send_quantum (tc, expected_rate) == 2 * tc->snd_mss,
 	    "bbr send quantum respects small MSS (%u)", bbr_send_quantum (tc, expected_rate));
   tcp_test_bbr_cleanup (tc);
+  state = format (0, "%U%c", tc->cc_algo->format, tc, 0);
+  TCP_TEST (strstr ((char *) state, "not initialized") != 0,
+	    "bbr formats a connection after releasing its pool state: %s", state);
+  vec_free (state);
 
   /* Refresh the cached quantum when the effective MSS changes without a
    * pacing-rate change. Start from a 4 segment initial window. */

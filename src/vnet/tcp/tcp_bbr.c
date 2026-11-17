@@ -798,12 +798,19 @@ static u8 *
 format_tcp_bbr (u8 *s, va_list *args)
 {
   tcp_connection_t *tc = va_arg (*args, tcp_connection_t *);
-  bbr_data_t *bd = bbr_data (tc);
-  u32 bdp = bbr_bdp_multiple (tc, bd, 1.0);
-  u32 extra_acked = bbr_minmax_get (&bd->extra_acked);
-  u32 inflight_target = bbr_max_inflight (tc, bd);
+  bbr_data_ref_t *ref = (bbr_data_ref_t *) tcp_cc_data (tc);
+  bbr_data_t *bd;
+  u32 bdp, extra_acked, inflight_target;
   u32 indent = format_get_indent (s);
 
+  /* Half-open and cleaned-up connections have no BBR pool entry. */
+  if (!ref->state_index_plus_one)
+    return format (s, "not initialized");
+
+  bd = bbr_data (tc);
+  bdp = bbr_bdp_multiple (tc, bd, 1.0);
+  extra_acked = bbr_minmax_get (&bd->extra_acked);
+  inflight_target = bbr_max_inflight (tc, bd);
   if (bd->mode == BBR_PROBE_RTT)
     inflight_target = clib_min (inflight_target, bbr_probe_rtt_cwnd (tc, bd));
   inflight_target = bbr_bound_cwnd_for_model (tc, bd, inflight_target);

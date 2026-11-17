@@ -490,6 +490,16 @@ vcl_session_connected_handler (vcl_worker_t * wrk,
 
   if (mp->retval)
     {
+      /* The connect context is the pool index. An app close must retain
+       * that index until this reply, including shared-session closes. */
+      if (session->session_state == VCL_STATE_CLOSED)
+	{
+	  if (session->flags & VCL_SESSION_F_PENDING_DISCONNECT)
+	    session->flags |= VCL_SESSION_F_PENDING_FREE;
+	  else
+	    vcl_session_free (wrk, session);
+	  return VCL_INVALID_SESSION_INDEX;
+	}
       VDBG (0, "session %u: connect failed! %U", session_index,
 	    format_session_error, mp->retval);
       session->session_state = VCL_STATE_DETACHED;
@@ -572,7 +582,7 @@ vcl_session_reset_handler (vcl_worker_t * wrk,
 
   sid = vcl_session_index_from_vpp_handle (wrk, reset_msg->handle);
   session = vcl_session_get (wrk, sid);
-  if (!session)
+  if (!session || session->session_state == VCL_STATE_DETACHED)
     {
       VDBG (0, "request to reset unknown handle 0x%llx", reset_msg->handle);
       return VCL_INVALID_SESSION_INDEX;
@@ -773,7 +783,7 @@ vcl_session_disconnected_handler (vcl_worker_t * wrk,
     }
 
   /* Late disconnect notification on a session that has been closed */
-  if (session->session_state == VCL_STATE_CLOSED)
+  if (session->session_state == VCL_STATE_CLOSED || session->session_state == VCL_STATE_DETACHED)
     return 0;
 
   /* Caught a disconnect before actually accepting the session */
@@ -1177,7 +1187,7 @@ vcl_handle_mq_event (vcl_worker_t * wrk, session_event_t * e)
       disconnected_msg = (session_disconnected_msg_t *) e->data;
       if (!(s = vcl_session_get_w_vpp_handle (wrk, disconnected_msg->handle)))
 	break;
-      if (s->session_state == VCL_STATE_CLOSED)
+      if (s->session_state == VCL_STATE_CLOSED || s->session_state == VCL_STATE_DETACHED)
 	break;
       /* We do not postpone for blocking sessions or listen sessions because:
        * 1. Blocking sessions are not part of epoll instead they're used in a
@@ -1205,7 +1215,7 @@ vcl_handle_mq_event (vcl_worker_t * wrk, session_event_t * e)
       reset_msg = (session_reset_msg_t *) e->data;
       if (!(s = vcl_session_get_w_vpp_handle (wrk, reset_msg->handle)))
 	break;
-      if (s->session_state == VCL_STATE_CLOSED)
+      if (s->session_state == VCL_STATE_CLOSED || s->session_state == VCL_STATE_DETACHED)
 	break;
       /* We do not postpone for blocking sessions or listen sessions because:
        * 1. Blocking sessions are not part of epoll instead they're used in a
@@ -1840,6 +1850,14 @@ vcl_session_cleanup (vcl_worker_t * wrk, vcl_session_t * s,
 
   if (!do_disconnect)
     {
+      /* A pending nonblocking connect has no VPP handle yet. Its reply
+       * still references this worker's session index, so do not recycle it. */
+      if (s->session_state == VCL_STATE_UPDATED && !s->tx_fifo &&
+	  (s->flags & VCL_SESSION_F_CONNECTED))
+	{
+	  s->session_state = VCL_STATE_CLOSED;
+	  return rv;
+	}
       VDBG (1, "session %u [0x%llx] disconnect skipped",
 	    s->session_index, s->vpp_handle);
       goto cleanup;
@@ -2316,7 +2334,7 @@ vppcom_session_read_internal (uint32_t session_handle, void *buf, int n, u8 peek
   if (PREDICT_FALSE (!s || (s->flags & VCL_SESSION_F_IS_VEP)))
     return VPPCOM_EBADFD;
 
-  if (PREDICT_FALSE (!vcl_session_is_open (s)))
+  if (PREDICT_FALSE (!vcl_session_is_open (s) || !s->rx_fifo))
     {
       VDBG (0, "session %u[0x%llx] is not open! state 0x%x (%s)",
 	    s->session_index, s->vpp_handle, s->session_state,
@@ -2449,7 +2467,7 @@ vppcom_session_read_segments (uint32_t session_handle,
   if (PREDICT_FALSE (!s || (s->flags & VCL_SESSION_F_IS_VEP)))
     return VPPCOM_EBADFD;
 
-  if (PREDICT_FALSE (!vcl_session_is_open (s)))
+  if (PREDICT_FALSE (!vcl_session_is_open (s) || !s->rx_fifo))
     return vcl_session_closed_error (s);
 
   is_nonblocking = vcl_session_has_attr (s, VCL_SESS_ATTR_NONBLOCK);
@@ -2550,7 +2568,7 @@ vppcom_session_write_inline (vcl_worker_t *wrk, vcl_session_t *s, void *buf, siz
       return VPPCOM_EBADFD;
     }
 
-  if (PREDICT_FALSE (!vcl_session_is_open (s)))
+  if (PREDICT_FALSE (!vcl_session_is_open (s) || !s->tx_fifo))
     {
       VDBG (1, "session %u [0x%llx]: is not open! state 0x%x (%s)",
 	    s->session_index, s->vpp_handle, s->session_state,

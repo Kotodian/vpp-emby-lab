@@ -84,6 +84,64 @@ check_close_order (vcl_worker_t *wrk, u8 type, int use_select, int detach_first,
   CHECK (pool_elts (wrk->sessions) == 0);
 }
 
+static void
+check_pending_connect_close (vcl_worker_t *wrk, int do_disconnect)
+{
+  vcl_session_t *s = vcl_session_alloc (wrk), *other;
+  u32 index = s->session_index;
+  s->session_state = VCL_STATE_UPDATED;
+  s->flags = VCL_SESSION_F_CONNECTED;
+  s->vpp_handle = VCL_INVALID_SESSION_HANDLE;
+  vcl_session_set_attr (s, VCL_SESS_ATTR_NONBLOCK);
+  CHECK (vcl_session_cleanup (wrk, s, vcl_session_handle (s), do_disconnect) == 0);
+  CHECK (vcl_session_get (wrk, index) == s && s->session_state == VCL_STATE_CLOSED);
+  other = vcl_session_alloc (wrk);
+  CHECK (other->session_index != index);
+  vcl_session_free (wrk, other);
+  session_connected_msg_t reply = { .context = index, .retval = SESSION_E_REFUSED };
+  CHECK (vcl_session_connected_handler (wrk, &reply) == VCL_INVALID_SESSION_INDEX);
+  CHECK (vcl_session_get (wrk, index) == 0);
+}
+
+static void
+check_failed_connect (vcl_worker_t *wrk)
+{
+  vcl_session_t *s = vcl_session_alloc (wrk);
+  s->session_state = VCL_STATE_DETACHED;
+  s->vpp_handle = VCL_INVALID_SESSION_HANDLE;
+  s->vpp_error = SESSION_E_REFUSED;
+  vcl_session_set_attr (s, VCL_SESS_ATTR_NONBLOCK);
+  /* A late old-handle notification must not turn this failed, FIFO-less
+   * connect back into an open VPP_CLOSING session, as in the qbit core. */
+  vcl_session_table_add_vpp_handle (wrk, 42, s->session_index);
+  session_event_t e = { .event_type = SESSION_CTRL_EVT_DISCONNECTED };
+  ((session_disconnected_msg_t *) e.data)->handle = 42;
+  vcl_handle_mq_event (wrk, &e);
+  CHECK (s->session_state == VCL_STATE_DETACHED);
+  CHECK (vec_len (wrk->unhandled_evts_vector) == 0);
+  CHECK (vcl_session_disconnected_handler (wrk, (void *) e.data) == 0);
+  e.event_type = SESSION_CTRL_EVT_RESET;
+  vcl_handle_mq_event (wrk, &e);
+  CHECK (s->session_state == VCL_STATE_DETACHED);
+  CHECK (vcl_session_reset_handler (wrk, (void *) e.data) == VCL_INVALID_SESSION_INDEX);
+  vcl_poll_t pollfd = { .sh = vcl_session_handle (s), .events = POLLOUT };
+  CHECK (vppcom_poll (&pollfd, 1, 0) == 1 && pollfd.revents == POLLERR);
+  vcl_session_table_del_vpp_handle (wrk, 42);
+  vcl_session_free (wrk, s);
+
+  s = vcl_session_alloc (wrk);
+  s->session_state = VCL_STATE_VPP_CLOSING;
+  CHECK (vcl_session_write_ready (s) == VPPCOM_ENOTCONN);
+  CHECK (vcl_session_read_ready (s) == VPPCOM_ENOTCONN);
+  CHECK (vcl_session_read_ready2 (s) == VPPCOM_ENOTCONN);
+  char byte = 0;
+  vppcom_data_segment_t segment;
+  CHECK (vppcom_session_read (vcl_session_handle (s), &byte, 1) == VPPCOM_ENOTCONN);
+  CHECK (vppcom_session_read_segments (vcl_session_handle (s), &segment, 1, 1) == VPPCOM_ENOTCONN);
+  CHECK (vppcom_session_write (vcl_session_handle (s), &byte, 1) == VPPCOM_ENOTCONN);
+  vcl_session_free (wrk, s);
+}
+
 int
 main (void)
 {
@@ -102,6 +160,10 @@ main (void)
   CHECK (shared != NULL);
   svm_msg_q_attach (&app_queue, shared);
   wrk->app_event_queue = &app_queue;
+
+  check_pending_connect_close (wrk, 0);
+  check_pending_connect_close (wrk, 1);
+  check_failed_connect (wrk);
 
   for (int use_select = 0; use_select < 3; use_select++)
     for (int reset = 0; reset < 2; reset++)

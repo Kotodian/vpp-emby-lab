@@ -1105,12 +1105,18 @@ tcp_session_attribute (u32 conn_index, clib_thread_index_t thread_index,
 }
 
 static u16
-tcp_session_cal_goal_size (tcp_connection_t * tc)
+tcp_session_cal_goal_size (tcp_connection_t *tc)
 {
-  u16 goal_size = tc->snd_mss;
+  u32 goal_size = clib_min (tcp_cfg.max_gso_size, (u32) CLIB_U16_MAX);
 
-  goal_size = tcp_cfg.max_gso_size - tcp_cfg.max_gso_size % tc->snd_mss;
   goal_size = clib_min (goal_size, tc->snd_wnd / 2);
+
+  /* The session layer rounds paced sends to this goal, not the wire MSS.
+   * Bound it by the current pacing allowance before rounding, otherwise a
+   * one-MSS burst plus a few credit bytes becomes a second tiny segment. */
+  if (transport_connection_is_tx_paced (&tc->connection))
+    goal_size = clib_min (goal_size, transport_connection_tx_pacer_burst (&tc->connection));
+  goal_size -= goal_size % tc->snd_mss;
 
   return goal_size > tc->snd_mss ? goal_size : tc->snd_mss;
 }

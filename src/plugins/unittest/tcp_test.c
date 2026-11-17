@@ -11872,6 +11872,120 @@ tcp_test_dsack_undo (void)
   return 0;
 }
 
+static int
+tcp_test_tso (vlib_main_t *vm)
+{
+  tcp_e2e_params_t params = {
+    .name = "paced_tso",
+    .client_addr = 0x0a0a0a01,
+    .server_addr = 0x0b0b0b01,
+    .client_vrf = 0,
+    .server_vrf = 2,
+    .server_port = 2291,
+    .secret = 2290,
+    .rx_fifo_size = 128 << 10,
+    .tx_fifo_size = 128 << 10,
+  };
+  tcp_e2e_ctx_t ctx;
+  tcp_connection_t *tc;
+  transport_send_params_t sp;
+  u32 mss, budget, expected;
+  int rv = 0;
+
+  if (!TCP_TEST_I (!tcp_e2e_setup (vm, &ctx, &params), "TSO send-params setup"))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+  tc = ctx.client_tc;
+  tc->cfg_flags |= TCP_CFG_F_TSO;
+  tc->mss = tc->rcv_opts.mss = 1460;
+  tc->snd_wnd = tc->cwnd = 128 << 10;
+  /* Keep an outstanding byte so send-params does not restart an idle pacer.
+   * The graph stays paused until teardown resets the test connection. */
+  tc->snd_nxt = tc->snd_una + 1;
+
+  for (u32 timestamps = 0; timestamps < 2; timestamps++)
+    {
+      if (timestamps)
+	tc->rcv_opts.flags |= TCP_OPTS_FLAG_TSTAMP;
+      else
+	tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_TSTAMP;
+      tc->connection.flags &= ~TRANSPORT_CONNECTION_F_IS_TX_PACED;
+      transport_connection_snd_params (&tc->connection, &sp);
+      mss = tc->snd_mss;
+      expected = tcp_cfg.max_gso_size - tcp_cfg.max_gso_size % mss;
+      if (!TCP_TEST_I (sp.snd_mss == expected, "unpaced TSO retains large batches (TS %u)",
+		       timestamps))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+
+      for (u32 packets = 1; packets <= 4; packets *= 2)
+	{
+	  /* Pacing credit is not generally an MSS multiple. It must not
+	   * produce a tiny extra segment after hardware segmentation. */
+	  budget = clib_max (mss * packets, (u32) TRANSPORT_PACER_MIN_BURST) + 7;
+	  transport_connection_tx_pacer_init (&tc->connection, 1000000, 0, mss);
+	  tc->c_pacer.max_burst = budget - 7;
+	  tc->c_pacer.catchup_credit = 7;
+	  transport_connection_snd_params (&tc->connection, &sp);
+	  if (!TCP_TEST_I (sp.snd_mss == packets * mss,
+			   "paced TSO offers %u full segments within %u bytes (TS %u)", packets,
+			   budget, timestamps))
+	    {
+	      rv = 1;
+	      goto cleanup;
+	    }
+	}
+
+      tc->c_pacer.bucket = -1;
+      transport_connection_snd_params (&tc->connection, &sp);
+      if (!TCP_TEST_I (sp.snd_mss == mss && sp.snd_space && !sp.flags,
+		       "pacing debt retains a sendable goal without descheduling (TS %u)",
+		       timestamps))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      tc->c_pacer.bucket = 0;
+      tc->c_pacer.catchup_credit = 0;
+      tc->snd_wnd = 5 * mss + 1;
+      tc->c_pacer.max_burst = 8 * mss;
+      transport_connection_snd_params (&tc->connection, &sp);
+      if (!TCP_TEST_I (sp.snd_mss == 2 * mss,
+		       "receive-window bound preserves whole TSO segments (TS %u)", timestamps))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      tc->snd_wnd = tc->cwnd;
+      tc->cfg_flags &= ~TCP_CFG_F_TSO;
+      transport_connection_snd_params (&tc->connection, &sp);
+      if (!TCP_TEST_I (sp.snd_mss == mss, "non-TSO sender retains wire MSS (TS %u)", timestamps))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      tc->cfg_flags |= TCP_CFG_F_TSO;
+    }
+
+  /* A 64-KiB GSO maximum must not wrap the u16 goal to zero when the
+   * wire MSS divides it exactly. Session uses the goal as a divisor. */
+  tc->mss = tc->rcv_opts.mss = 1024;
+  tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_TSTAMP;
+  tc->connection.flags &= ~TRANSPORT_CONNECTION_F_IS_TX_PACED;
+  transport_connection_snd_params (&tc->connection, &sp);
+  if (!TCP_TEST_I (sp.snd_mss == 63 * 1024, "64-KiB TSO maximum fits the u16 send goal"))
+    rv = 1;
+
+cleanup:
+  if (!tcp_e2e_teardown (vm, &ctx))
+    rv = 1;
+  return rv;
+}
+
 static clib_error_t *
 tcp_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd_arg)
 {
@@ -11928,6 +12042,8 @@ tcp_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd_arg)
 	{
 	  res = tcp_test_bbr (vm, input);
 	}
+      else if (unformat (input, "tso"))
+	res = tcp_test_tso (vm);
       else if (unformat (input, "bt"))
 	{
 	  res = tcp_test_bt (vm, input);
@@ -11969,6 +12085,8 @@ tcp_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd_arg)
 	  if ((res = tcp_test_cubic (vm, input)))
 	    goto done;
 	  if ((res = tcp_test_bbr (vm, input)))
+	    goto done;
+	  if ((res = tcp_test_tso (vm)))
 	    goto done;
 	  if ((res = tcp_test_bt (vm, input)))
 	    goto done;

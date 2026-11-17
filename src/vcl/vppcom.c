@@ -4922,7 +4922,10 @@ vppcom_poll (vcl_poll_t * vp, uint32_t n_sids, double wait_for_time)
 	  if (POLLIN & vp[i].events)
 	    {
 	      rv = vcl_session_read_ready (session);
-	      if (rv > 0)
+	      /* An orderly peer close remains readable after the FIFO drains:
+	       * read() must be allowed to return EOF. Relays otherwise retain
+	       * closed connections indefinitely while waiting for more data. */
+	      if (rv > 0 || (rv == 0 && session->session_state == VCL_STATE_VPP_CLOSING))
 		{
 		  vp[i].revents |= POLLIN;
 		  num_ev++;

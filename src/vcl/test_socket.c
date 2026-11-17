@@ -360,6 +360,17 @@ test_listener_close (void)
   sessions[0].session_state = VCL_STATE_READY;
   CHECK (vppcom_poll (&vp, 1, 0) > 0);
   CHECK (vp.revents == POLLOUT);
+
+  /* A drained stream with peer FIN is readable until the application
+   * consumes EOF and closes it, including cut-through WebUI connections. */
+  sessions[0].session_state = VCL_STATE_VPP_CLOSING;
+  vp.events = POLLIN;
+  CHECK (vppcom_poll (&vp, 1, 0) == 1);
+  CHECK (vp.revents == POLLIN);
+  char byte;
+  CHECK (vppcom_session_read (0, &byte, 1) == 0);
+  CHECK (vppcom_poll (&vp, 1, 0) == 1);
+  sessions[0].session_state = VCL_STATE_READY;
 }
 
 static void

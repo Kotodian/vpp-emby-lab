@@ -4902,12 +4902,18 @@ vppcom_poll (vcl_poll_t * vp, uint32_t n_sids, double wait_for_time)
 	  vcl_handle_mq_event (wrk, e);
 	  svm_msg_q_free_msg (wrk->app_event_queue, &msg);
 	}
-      u32 n_pending = 0;
+      u32 n_pending = 0, ignored = 0;
       vec_foreach (e, wrk->unhandled_evts_vector)
 	{
 	  session = vcl_session_get (wrk, e->session_index);
 	  if (session && (session->flags & VCL_SESSION_F_IS_VEP_SESSION))
 	    wrk->unhandled_evts_vector[n_pending++] = *e;
+	  else if (session && e->postponed &&
+		   (e->event_type == SESSION_CTRL_EVT_DISCONNECTED ||
+		    e->event_type == SESSION_CTRL_EVT_RESET))
+	    /* Poll observes the closing state below. Consume its postponed
+	     * notification too, including a pending free after epoll DEL/close. */
+	    vcl_select_handle_mq_event (wrk, e, 0, 0, 0, 0, &ignored);
 	}
       if (wrk->unhandled_evts_vector)
 	vec_set_len (wrk->unhandled_evts_vector, n_pending);

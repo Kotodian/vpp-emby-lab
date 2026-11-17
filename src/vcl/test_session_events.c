@@ -6,6 +6,7 @@
 #include "vppcom.c"
 
 static unsigned checks;
+static svm_msg_q_t app_queue;
 #define CHECK(expr)                                                                                \
   do                                                                                               \
     {                                                                                              \
@@ -25,7 +26,12 @@ consume_closed (vcl_worker_t *wrk, session_event_t *e, int use_select)
   uword read = 0, write = 0, except = 0;
   u32 count = 0;
 
-  if (use_select)
+  if (use_select == 2)
+    {
+      vcl_poll_t pollfd = { 0 };
+      CHECK (vppcom_poll (&pollfd, 0, 0) == 0);
+    }
+  else if (use_select)
     {
       vcl_select_handle_mq_event (wrk, e, BITS (uword), &read, &write, &except, &count);
       CHECK (read == 0 && write == 0 && except == 0);
@@ -89,8 +95,15 @@ main (void)
   pool_get_zero (vcm->workers, wrk);
   pool_alloc (wrk->sessions, 8);
   vcl_set_worker_index (0);
+  clib_time_init (&wrk->clib_time);
+  svm_msg_q_ring_cfg_t ring = { 8, sizeof (session_event_t), 0 };
+  svm_msg_q_cfg_t cfg = { .consumer_pid = ~0, .q_nitems = 8, .n_rings = 1, .ring_cfgs = &ring };
+  svm_msg_q_shared_t *shared = svm_msg_q_alloc (&cfg);
+  CHECK (shared != NULL);
+  svm_msg_q_attach (&app_queue, shared);
+  wrk->app_event_queue = &app_queue;
 
-  for (int use_select = 0; use_select < 2; use_select++)
+  for (int use_select = 0; use_select < 3; use_select++)
     for (int reset = 0; reset < 2; reset++)
       {
 	u8 type = reset ? SESSION_CTRL_EVT_RESET : SESSION_CTRL_EVT_DISCONNECTED;
@@ -118,6 +131,11 @@ main (void)
 			    .session_index = s->session_index };
   struct epoll_event ev = { 0 };
   u32 count = 0;
+  vec_add1 (wrk->unhandled_evts_vector, event);
+  vcl_poll_t pollfd = { 0 };
+  CHECK (vppcom_poll (&pollfd, 0, 0) == 0);
+  CHECK (vec_len (wrk->unhandled_evts_vector) == 1);
+  CHECK (s->flags & VCL_SESSION_F_PENDING_DISCONNECT);
   vcl_epoll_wait_handle_mq_event (wrk, &event, &ev, &count);
   CHECK (count == 1 && ev.events == EPOLLRDHUP && ev.data.u64 == 0xabcdef);
   CHECK (!(s->flags & VCL_SESSION_F_PENDING_DISCONNECT));

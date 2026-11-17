@@ -77,6 +77,11 @@ if [ "$current" != igb ]; then
 fi
 [ "$(basename "$(readlink "$device/driver")")" = igb ]
 
+# igb initially publishes eth0; udev can rename it while addresses and
+# routes are being restored. Wait before retaining the interface name.
+if command -v udevadm >/dev/null 2>&1; then
+  run udevadm settle --timeout=10
+fi
 iface=''
 for ((attempt=0; attempt<20; attempt++)); do
   for path in "$device"/net/*; do
@@ -87,8 +92,13 @@ for ((attempt=0; attempt<20; attempt++)); do
 done
 [ -n "$iface" ]
 run ip link set "$iface" up
+for ((attempt=0; attempt<20; attempt++)); do
+  [ "$(cat "/sys/class/net/$iface/carrier" 2>/dev/null)" = 1 ] && break
+  sleep 0.25
+done
 run ip address replace "$ADDRESS" dev "$iface"
 run ip route replace default via "$GATEWAY" dev "$iface" onlink src "${ADDRESS%/*}"
+run ip neighbor replace "$GATEWAY" lladdr 00:1c:73:00:00:02 nud permanent dev "$iface"
 if ip link show vpp-punt >/dev/null 2>&1; then
   run ip link delete vpp-punt
 fi

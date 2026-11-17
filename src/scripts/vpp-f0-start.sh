@@ -1,8 +1,16 @@
 #!/bin/bash
 set -u
 ROOT=/root/netsystem-rs/third_party/vpp
-VPP=$ROOT/build-vpp-lab-install/bin/vpp
-VCTL="$ROOT/build-vpp-lab-install/bin/vppctl -s /run/vpp-dpdk/cli.sock"
+if [ -r /etc/default/vpp-f0 ]; then . /etc/default/vpp-f0; fi
+VPP_INSTALL_DIR=${VPP_INSTALL_DIR:-$ROOT/build-vpp-lab-install}
+VPP=$VPP_INSTALL_DIR/bin/vpp
+VCTL="$VPP_INSTALL_DIR/bin/vppctl -s /run/vpp-dpdk/cli.sock"
+export LD_LIBRARY_PATH="$VPP_INSTALL_DIR/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+if [ -e /run/vpp-wan-recovery-required ]; then
+  echo 'vpp-f0: WAN recovery is still pending; refusing a competing cutover' >&2
+  exit 1
+fi
 
 ulimit -c unlimited
 
@@ -13,7 +21,10 @@ for module in vfio vfio_iommu_type1 vfio-pci; do
   }
 done
 
-if ! pgrep -x vpp_main >/dev/null; then
+pid=$(cat /run/vpp-dpdk/vpp.pid 2>/dev/null || true)
+if ! { [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null &&
+       [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = vpp_main ] &&
+       timeout 5 $VCTL show version >/dev/null 2>&1; }; then
   ip link set enp2s0f0 down 2>/dev/null || true
   /usr/bin/dpdk-devbind.py --bind=vfio-pci 0000:02:00.0 >/dev/null 2>&1 || true
   setsid nohup $VPP -c /etc/vpp-dpdk/startup-f0.conf >/tmp/vpp-dpdk-f0.stdout 2>&1 </dev/null &
@@ -31,15 +42,6 @@ if ! pgrep -x vpp_main >/dev/null; then
   fi
 fi
 
-# Type=forking uses this file to track the VPP process.  VPP normally writes
-# it itself, but make sure systemd can still adopt an already-running VPP
-# when this script is used to recover the unit.
-pid=$(pgrep -x vpp_main | head -n 1)
-if [ -n "$pid" ]; then
-  mkdir -p /run/vpp-dpdk
-  echo "$pid" > /run/vpp-dpdk/vpp.pid
-fi
-
 $VCTL create loopback interface instance 0 >/dev/null 2>&1 || true
 $VCTL set interface state loop0 up >/dev/null 2>&1 || true
 $VCTL set interface ip address loop0 10.255.0.1/32 >/dev/null 2>&1 || true
@@ -54,7 +56,7 @@ $VCTL ip neighbor GigabitEthernet2/0/0 184.107.84.254 00:1c:73:00:00:02 >/dev/nu
 $VCTL create tap id 10 if-name punt0 host-if-name vpp-punt tun host-mtu-size 1500 gso gro-coalesce csum-offload >/dev/null 2>&1 || true
 $VCTL set interface state punt0 up >/dev/null 2>&1 || true
 $VCTL set interface ip address punt0 10.30.0.1/30 >/dev/null 2>&1 || true
-$VCTL set interface mtu 1500 punt0 >/dev/null 2>&1 || true
+$VCTL set interface mtu packet 1500 punt0 >/dev/null 2>&1 || true
 $VCTL set punt tcp all >/dev/null 2>&1 || true
 $VCTL set punt udp all >/dev/null 2>&1 || true
 $VCTL ip punt redirect add rx GigabitEthernet2/0/0 via 10.30.0.2 punt0 >/dev/null 2>&1 || true
@@ -80,5 +82,21 @@ $VCTL http static server www-root /srv/media cache-size 64m max-age 0 >/dev/null
 $VCTL http static listener add uri tcp://10.255.0.1/8080 www-root /srv/media cache-size 64m url-handlers >/dev/null 2>&1 || true
 
 bash /usr/local/sbin/vpp-emby-dnat.sh >/dev/null 2>&1 || true
+connected=0
+for ((attempt=0; attempt<3; attempt++)); do
+  for target in 1.1.1.1:443 8.8.8.8:53 9.9.9.9:53; do
+    if timeout 3 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "${target%:*}" "${target#*:}" 2>/dev/null; then
+      connected=1
+      break
+    fi
+  done
+  [ "$connected" = 1 ] && break
+  sleep 1
+done
+if [ "$connected" != 1 ]; then
+  echo 'vpp-f0: WAN connectivity failed; requesting kernel recovery' >&2
+  touch /run/vpp-wan-recovery-required
+  exit 1
+fi
 touch /run/wan-cutover
 echo "vpp-f0 ready"

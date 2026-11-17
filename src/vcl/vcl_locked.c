@@ -565,6 +565,7 @@ static void
 vls_worker_free (vls_worker_t * wrk)
 {
   hash_free (wrk->sh_to_vlsh_table);
+  vec_free (wrk->pending_vcl_wrk_cleanup);
   if (vls_mt_wrk_supported ())
     clib_rwlock_free (&wrk->sh_to_vlsh_table_lock);
   pool_free (wrk->vls_pool);
@@ -1870,7 +1871,20 @@ vls_unshare_vcl_worker_sessions (vcl_worker_t * wrk)
 static void
 vls_cleanup_vcl_worker (vcl_worker_t * wrk)
 {
-  vls_worker_t *vls_wrk = vls_worker_get (wrk->wrk_index);
+  vls_worker_t *vls_wrk, *candidate;
+
+  /* VCL and VLS workers use separate pools. A child can have already
+   * released its VLS worker, and reused pool slots need not have the same
+   * index. Never free an unrelated VLS worker by its VCL pool index. */
+  vls_wrk = 0;
+  pool_foreach (candidate, vlsm->workers)
+    {
+      if (candidate->vcl_wrk_index == wrk->wrk_index)
+	{
+	  vls_wrk = candidate;
+	  break;
+	}
+    }
 
   /* Unshare sessions and also cleanup worker since child may have
    * called _exit () and therefore vcl may not catch the event */
@@ -1881,13 +1895,15 @@ vls_cleanup_vcl_worker (vcl_worker_t * wrk)
    */
   vcl_worker_cleanup (wrk, vcm->cfg.vpp_app_socket_api ? 0 : 1);
 
-  vls_worker_free (vls_wrk);
+  if (vls_wrk)
+    vls_worker_free (vls_wrk);
 }
 
 static void
 vls_cleanup_forked_child (vcl_worker_t * wrk, vcl_worker_t * child_wrk)
 {
   vcl_worker_t *sub_child;
+  u32 child_index = child_wrk->wrk_index;
   int tries = 0;
 
   if (child_wrk->forked_child != ~0)
@@ -1903,7 +1919,7 @@ vls_cleanup_forked_child (vcl_worker_t * wrk, vcl_worker_t * child_wrk)
 	}
     }
   vls_cleanup_vcl_worker (child_wrk);
-  VDBG (0, "Cleaned up forked child wrk %u", child_wrk->wrk_index);
+  VDBG (0, "Cleaned up forked child wrk %u", child_index);
   wrk->forked_child = ~0;
 }
 

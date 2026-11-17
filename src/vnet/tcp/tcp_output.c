@@ -1928,6 +1928,12 @@ tcp_retransmit_sack_inline (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 bur
       tcp_enqueue_to_output (wrk, b, bi, tc->c_is_ip4);
       sent_bytes += n_written;
 
+      /* A repaired head needs a full RTO to return its ACK. Retaining an
+       * older deadline can time it out again before even one RTT elapses.
+       * Keep an active REO timer, and do not defer RTO for tail repairs. */
+      if (backend == TCP_RXT_BACKEND_RACK && offset == 0 && !tcp_rack_timer_is_reordering (tc))
+	tcp_retransmit_timer_update (&wrk->timer_wheel, tc);
+
       sb->high_rxt += n_written;
       ASSERT (seq_leq (sb->high_rxt, tc->snd_nxt));
 

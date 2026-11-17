@@ -10105,6 +10105,128 @@ cleanup:
 }
 
 static int
+tcp_test_rack_rto_restart (vlib_main_t *vm)
+{
+  tcp_e2e_params_t params = {
+    .name = "rack_rto_restart",
+    .client_addr = 0x0a0a0a01,
+    .server_addr = 0x0b0b0b01,
+    .client_vrf = 0,
+    .server_vrf = 2,
+    .server_port = 2293,
+    .secret = 2292,
+    .rx_fifo_size = 64 << 10,
+    .tx_fifo_size = 64 << 10,
+  };
+  transport_endpt_attr_t attr = {
+    .type = TRANSPORT_ENDPT_ATTR_CC_ALGO,
+    .cc_algo = TCP_CC_BBR,
+  };
+  u8 data[3000] = {};
+
+  for (u32 kind = 0; kind < 3; kind++)
+    {
+      tcp_e2e_ctx_t ctx;
+      tcp_connection_t *tc;
+      tcp_rack_state_t *rack;
+      tcp_bt_sample_t *bts;
+      session_worker_t *swrk = 0;
+      transport_send_params_t sp = { .max_burst_size = 1 };
+      u32 pending_bufs = 0, pending_nexts = 0, expected_seq;
+      f64 old_rto, old_reo, now;
+      int rv = 0;
+
+      if (!TCP_TEST_I (!tcp_e2e_setup (vm, &ctx, &params), "RACK head timer setup %u", kind))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      tc = ctx.client_tc;
+      if (!TCP_TEST_I (!session_transport_attribute (ctx.client_s, 0, &attr),
+		       "RACK head timer uses BBR %u", kind))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      tc->mss = tc->rcv_opts.mss = 1000;
+      tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_TSTAMP;
+      tc->cfg_flags &= ~TCP_CFG_F_TSO;
+      transport_connection_snd_params (&tc->connection, &sp);
+      tc->connection.flags &= ~TRANSPORT_CONNECTION_F_IS_TX_PACED;
+      if (!TCP_TEST_I (svm_fifo_enqueue (ctx.client_s->tx_fifo, sizeof (data), data) ==
+			 sizeof (data),
+		       "RACK head timer queues data %u", kind))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      /* Keep head and tail sample boundaries so the tail-only case cannot
+       * accidentally retransmit SND.UNA and postpone its RTO. */
+      tc->app_limited = 0;
+      tcp_bt_track_tx (tc, 1000);
+      tc->snd_nxt += 1000;
+      tc->app_limited = tc->delivered + 1000;
+      tcp_bt_track_tx (tc, 2000);
+      tc->snd_nxt += 2000;
+      tc->app_limited = 0;
+      bts = pool_elt_at_index (tc->bt->samples, kind == 1 ? tc->bt->tail : tc->bt->head);
+      tcp_rack_mark_sample_lost (tc, bts);
+      tc->sack_sb.lost_bytes += bts->max_seq - bts->min_seq;
+      tc->lost += bts->max_seq - bts->min_seq;
+      tcp_fastrecovery_on (tc);
+      tcp_rack_recovery_init (tc);
+      tc->snd_congestion = tc->snd_nxt;
+      tc->cwnd = 8000;
+      tc->rto = 0.48 * THZ;
+      tc->srtt = 0.28 * THZ;
+      tcp_retransmit_timer_reschedule (&tcp_get_worker (tc->c_thread_index)->timer_wheel, tc,
+				       0.15 / TCP_TIMER_TICK);
+      if (kind == 2)
+	tcp_rack_arm_reorder_timer (tc, 0.05, 0);
+      rack = tcp_rack_get_state (tc);
+      old_rto = rack->rto_deadline;
+      old_reo = rack->reo_deadline;
+      now = tcp_time_now_us (tc->c_thread_index);
+      swrk = session_main_get_worker (tc->c_thread_index);
+      pending_bufs = vec_len (swrk->pending_tx_buffers);
+      pending_nexts = vec_len (swrk->pending_tx_nexts);
+      expected_seq = tc->snd_una + (kind == 1 ? 1000 : 0);
+      tc->flags |= TCP_CONN_RXT_PENDING;
+      sp.max_burst_size = 1;
+      if (!TCP_TEST_I (
+	    transport_custom_tx (TRANSPORT_PROTO_TCP, &tc->connection, &sp) == 1 &&
+	      vec_len (swrk->pending_tx_buffers) == pending_bufs + 1 &&
+	      clib_net_to_host_u32 (((tcp_header_t *) vlib_buffer_get_current (vlib_get_buffer (
+				       vm, swrk->pending_tx_buffers[pending_bufs])))
+				      ->seq_number) == expected_seq,
+	    "RACK recovery transmits the selected segment %u", kind))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      if (!TCP_TEST_I (kind == 0 ? rack->rto_deadline > now + 0.479 : rack->rto_deadline == old_rto,
+		       "RACK head retransmission refreshes RTO; tail and REO retain it %u", kind) ||
+	  !TCP_TEST_I (rack->reo_deadline == old_reo,
+		       "RACK retransmission preserves REO deadline %u", kind))
+	rv = 1;
+
+    cleanup:
+      if (swrk)
+	{
+	  for (u32 i = pending_bufs; i < vec_len (swrk->pending_tx_buffers); i++)
+	    vlib_buffer_free_one (vm, swrk->pending_tx_buffers[i]);
+	  vec_set_len (swrk->pending_tx_buffers, pending_bufs);
+	  vec_set_len (swrk->pending_tx_nexts, pending_nexts);
+	}
+      if (!tcp_e2e_teardown (vm, &ctx))
+	rv = 1;
+      if (rv)
+	return rv;
+    }
+  return 0;
+}
+
+static int
 tcp_test_rack (vlib_main_t *vm, unformat_input_t *input)
 {
   clib_thread_index_t thread_index = vm->thread_index;
@@ -10120,7 +10242,8 @@ tcp_test_rack (vlib_main_t *vm, unformat_input_t *input)
   u8 have_range, reo_wnd_updated, sack_reneged;
   tcp_cc_algorithm_t test_cc;
 
-  if (tcp_test_tlp_probe_output (vm, tc, thread_index, 0 /* expect_retransmit */) ||
+  if (tcp_test_rack_rto_restart (vm) ||
+      tcp_test_tlp_probe_output (vm, tc, thread_index, 0 /* expect_retransmit */) ||
       tcp_test_tlp_probe_output (vm, tc, thread_index, 1 /* expect_retransmit */))
     return 1;
 

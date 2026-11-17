@@ -4919,7 +4919,7 @@ vppcom_poll (vcl_poll_t * vp, uint32_t n_sids, double wait_for_time)
 
       /* Poll and epoll may share a VLS worker (Qt and Boost.Asio).
        * Process control messages, but preserve events owned by epoll. */
-      while (svm_msg_q_sub (wrk->app_event_queue, &msg, SVM_Q_NOWAIT, 0) == 0)
+      while (wrk->app_event_queue && svm_msg_q_sub (wrk->app_event_queue, &msg, SVM_Q_NOWAIT, 0) == 0)
 	{
 	  e = svm_msg_q_msg_data (wrk->app_event_queue, &msg);
 	  vcl_handle_mq_event (wrk, e);

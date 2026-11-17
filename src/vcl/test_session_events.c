@@ -156,6 +156,27 @@ check_detached_connect (vcl_worker_t *wrk)
   vcl_session_free (wrk, s);
 }
 
+static void
+check_detached_poll (vcl_worker_t *wrk)
+{
+  svm_msg_q_t *queue = wrk->app_event_queue;
+  vcl_session_t *s = vcl_session_alloc (wrk);
+  vcl_poll_t pollfd = { .sh = vcl_session_handle (s) };
+
+  /* VPP disconnect handling clears the worker queue and detaches sessions.
+   * poll still has to report their error readiness without touching the MQ. */
+  s->session_state = VCL_STATE_DETACHED;
+  s->flags |= VCL_SESSION_F_APP_CLOSING;
+  wrk->app_event_queue = 0;
+  pollfd.events = POLLIN;
+  CHECK (vppcom_poll (&pollfd, 1, -1) == 1 && pollfd.revents == POLLERR);
+  pollfd.events = POLLOUT;
+  CHECK (vppcom_poll (&pollfd, 1, -1) == 1 && pollfd.revents == POLLERR);
+  CHECK (vppcom_poll (&pollfd, 0, 0) == 0);
+  wrk->app_event_queue = queue;
+  vcl_session_free (wrk, s);
+}
+
 int
 main (void)
 {
@@ -179,6 +200,7 @@ main (void)
   check_pending_connect_close (wrk, 1);
   check_failed_connect (wrk);
   check_detached_connect (wrk);
+  check_detached_poll (wrk);
 
   for (int use_select = 0; use_select < 3; use_select++)
     for (int reset = 0; reset < 2; reset++)

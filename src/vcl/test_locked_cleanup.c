@@ -9,6 +9,7 @@
 #include "vcl_locked.c"
 
 static unsigned int checks, cleaned;
+static unsigned int flushed;
 
 #define CHECK(expr)                                                                                \
   do                                                                                               \
@@ -31,6 +32,15 @@ vcl_worker_cleanup (vcl_worker_t *wrk, u8 notify_vpp)
   cleaned++;
   clib_memset (wrk, 0xab, sizeof (*wrk));
   pool_put (vcm->workers, wrk);
+}
+
+void
+vcl_flush_mq_events (void)
+{
+  CHECK ((vlspt->locks_acq & (VLS_MT_LOCK_MQ | VLS_MT_WLOCK_SPOOL)) ==
+	 (VLS_MT_LOCK_MQ | VLS_MT_WLOCK_SPOOL));
+  CHECK (pthread_mutex_trylock (&vlsl->vls_mt_mq_mlock) == EBUSY);
+  flushed++;
 }
 
 static vcl_worker_t *
@@ -106,6 +116,18 @@ main (void)
   CHECK (cleaned == 4);
   vls_handle_pending_wrk_cleanup ();
   CHECK (cleaned == 4);
+  /* fork used to flush a live network thread's MQ without its mutex.
+   * Also cover a child that finishes before the parent handler runs. */
+  vls_mt_locks_init ();
+  clib_rwlock_init (&vlsl->vls_pool_lock);
+  vlsl->vls_mt_needs_locks = 1;
+  vls_app_pre_fork ();
+  CHECK (flushed == 1 && vcm->forking == 1);
+  __atomic_store_n (&vcm->forking, 0, __ATOMIC_RELEASE);
+  vls_app_fork_parent_handler ();
+  CHECK (vlspt->locks_acq == 0);
+  CHECK (pthread_mutex_trylock (&vlsl->vls_mt_mq_mlock) == 0);
+  CHECK (pthread_mutex_unlock (&vlsl->vls_mt_mq_mlock) == 0);
   printf ("PASS: %u VLS fork cleanup checks\n", checks);
   return 0;
 }

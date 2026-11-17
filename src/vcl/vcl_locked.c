@@ -2027,8 +2027,19 @@ vls_incercept_sigchld ()
 static void
 vls_app_pre_fork (void)
 {
+  /* A shared-worker application's network thread can be draining the
+   * same MQ or changing its session pools. Keep the snapshot stable until
+   * the child has copied it, in the normal pool -> MQ -> spool order. */
+  vls_mt_detect ();
+  vls_mt_pool_wlock ();
+  if (vlsl->vls_mt_needs_locks)
+    {
+      vls_mt_mq_lock ();
+      vls_mt_spool_wlock ();
+    }
   vls_incercept_sigchld ();
   vcl_flush_mq_events ();
+  __atomic_store_n (&vcm->forking, 1, __ATOMIC_RELEASE);
 }
 
 static void
@@ -2053,6 +2064,7 @@ vls_app_fork_child_handler (void)
   if (vppcom_worker_register ())
     {
       VERR ("couldn't register new worker!");
+      __atomic_store_n (&vcm->forking, 0, __ATOMIC_RELEASE);
       return;
     }
 
@@ -2063,6 +2075,8 @@ vls_app_fork_child_handler (void)
 
   /* Reset number of threads and set wrk index */
   vlsl->vls_mt_n_threads = 1;
+  vlsl->vls_mt_needs_locks = 0;
+  vlspt->locks_acq = 0;
   vlsl->vls_wrk_index = vls_wrk - vlsm->workers;
   vlsl->select_mp_check = 0;
   clib_rwlock_init (&vlsl->vls_pool_lock);
@@ -2073,15 +2087,17 @@ vls_app_fork_child_handler (void)
   parent_wrk->forked_child = vcl_get_worker_index ();
 
   VDBG (0, "forked child main worker initialized");
-  vcm->forking = 0;
+  __atomic_store_n (&vcm->forking, 0, __ATOMIC_RELEASE);
 }
 
 static void
 vls_app_fork_parent_handler (void)
 {
-  vcm->forking = 1;
-  while (vcm->forking)
-    ;
+  while (__atomic_load_n (&vcm->forking, __ATOMIC_ACQUIRE))
+    CLIB_PAUSE ();
+  if (vlsl->vls_mt_needs_locks)
+    vls_mt_rel_locks ();
+  vls_mt_pool_wunlock ();
 }
 
 void

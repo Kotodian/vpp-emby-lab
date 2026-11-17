@@ -2178,6 +2178,11 @@ vppcom_session_connect (uint32_t session_handle, vppcom_endpt_t * server_ep)
       return VPPCOM_EBADFD;
     }
 
+  /* Detach clears the worker's control queue. New app connection attempts
+   * can race the supervisor stopping the app after VPP exits. */
+  if (PREDICT_FALSE (!vcl_worker_ctrl_mq (wrk)))
+    return VPPCOM_ENOTCONN;
+
   /* If NONBLOCK connect already in flight report EALREADY instead.
    * posix alllows polling connect() to fetch the socket status
    * would otherwise spawn a fresh VPP session_connect per poll. */

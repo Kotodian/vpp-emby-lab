@@ -142,6 +142,20 @@ check_failed_connect (vcl_worker_t *wrk)
   vcl_session_free (wrk, s);
 }
 
+static void
+check_detached_connect (vcl_worker_t *wrk)
+{
+  vcl_session_t *s = vcl_session_alloc (wrk);
+  u8 ip[4] = { 192, 0, 2, 1 };
+  vppcom_endpt_t peer = { .is_ip4 = 1, .ip = ip, .port = clib_host_to_net_u16 (12345) };
+  u8 state = s->session_state;
+  CHECK (wrk->ctrl_mq == 0);
+  CHECK (vppcom_session_connect (vcl_session_handle (s), &peer) == VPPCOM_ENOTCONN);
+  CHECK (s->session_state == state);
+  CHECK (!(s->flags & VCL_SESSION_F_CONNECTED));
+  vcl_session_free (wrk, s);
+}
+
 int
 main (void)
 {
@@ -164,6 +178,7 @@ main (void)
   check_pending_connect_close (wrk, 0);
   check_pending_connect_close (wrk, 1);
   check_failed_connect (wrk);
+  check_detached_connect (wrk);
 
   for (int use_select = 0; use_select < 3; use_select++)
     for (int reset = 0; reset < 2; reset++)

@@ -23,12 +23,12 @@ async () => {
     const own = torrents.filter(t => t.category === category);
     const active = own.filter(t => t.progress < 1 && !/paused|stopped/i.test(t.state));
     const today = moment().startOf('day').unix();
-    const dailyBudget = 400 * 1024 ** 3 - own.filter(t => t.addedTime >= today).reduce((sum, t) => sum + t.size, 0);
+    const dailyBudget = 512 * 1024 ** 3 - own.filter(t => t.addedTime >= today).reduce((sum, t) => sum + t.size, 0);
     const reserved = own.filter(t => t.progress < 1).reduce((sum, t) => sum + Math.max(0, t.size - t.completed), 0);
     let budget = Math.min(dailyBudget, client.maindata.freeSpaceOnDisk - 1024 ** 4 - reserved);
     const hourlySlots = Math.max(0, task.addCountPerHour - task.addCount);
     const slots = Math.max(0, Math.min(6 - active.length, hourlySlots, 1));
-    if (!slots || budget < 8 * 1024 ** 3) {
+    if (!slots || budget < 20 * 1024 ** 3) {
       fs.writeFileSync('/vertex/data/mt-selection-plan.json', JSON.stringify({ time: new Date(), reason: 'concurrency/daily-size/free-space limit', slots, budget }, null, 2)); return;
     }
     const schedulePath = '/vertex/data/mt-selection-schedule.json';

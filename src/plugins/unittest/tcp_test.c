@@ -1984,7 +1984,7 @@ tcp_test_bbr (vlib_main_t *vm, unformat_input_t *input)
   bbr_data_t bd = {};
   u64 expected_rate;
   int switch_rv;
-  u32 i;
+  u32 i, prior_cwnd;
   u16 multiplier;
   u8 *state, switch_rejected, no_sack_rejected, bbr_selected;
 
@@ -2143,6 +2143,65 @@ tcp_test_bbr (vlib_main_t *vm, unformat_input_t *input)
 	    "bbr exits startup after three plateau rounds: %s", state);
   vec_free (state);
   tcp_test_bbr_cleanup (tc);
+
+  /* A loss-only duplicate ACK has no transmit snapshot from which to infer
+   * an excessive loss fraction. It must not terminate bandwidth probing. */
+  for (u32 loss_case = 0; loss_case < 2; loss_case++)
+    {
+      tcp_test_set_time (thread_index, 30);
+      tcp_test_bbr_init (tc, thread_index, 1000, 0.1);
+      for (i = 0; i < 6; i++)
+	{
+	  tcp_test_set_time (thread_index, i < 4 ? 30.0 + i * 0.1 : 34.0 + (i - 4) * 0.1);
+	  clib_memset (&ac, 0, sizeof (ac));
+	  ac.acked_and_sacked = ac.delivered = 10000;
+	  ac.interval_time = ac.rtt_time = 0.1;
+	  ac.prior_delivered = tc->delivered;
+	  ac.tx_in_flight = tc->cwnd;
+	  tc->delivered += ac.delivered;
+	  tc->cc_algo->rcv_ack (tc, &ac);
+	}
+      state = format (0, "%U%c", tc->cc_algo->format, tc, 0);
+      TCP_TEST (strstr ((char *) state, "state 2/3") != 0,
+		"bbr reaches bandwidth probing before loss-only ACK: %s", state);
+      vec_free (state);
+      prior_cwnd = tc->cwnd;
+      clib_memset (&ac, 0, sizeof (ac));
+      tc->lost += 1000;
+      ac.last_lost = ac.lost = 1000;
+      tc->cc_algo->rcv_cong_ack (tc, TCP_CC_DUPACK, &ac);
+      TCP_TEST (tc->cwnd == prior_cwnd,
+		"bbr loss without a transmit snapshot preserves probing cwnd (%u)", tc->cwnd);
+
+      if (loss_case == 0)
+	{
+	  /* Per-transmission loss still carries a denominator even if this ACK
+	   * delivers no bytes and has no rate or RTT sample. */
+	  ac.tx_in_flight = 10000;
+	  tc->cc_algo->rcv_cong_ack (tc, TCP_CC_DUPACK, &ac);
+	  TCP_TEST (tc->cwnd < prior_cwnd,
+		    "bbr valid transmit loss still reduces probing cwnd (%u)", tc->cwnd);
+	}
+      else
+	{
+	  /* Losing the entire snapshot gives bbr_inflight_at_loss a zero-length
+	   * prefix. The lost_sample callback must still tighten the model; the
+	   * denominator guard belongs before that prefix calculation. */
+	  tcp_cc_loss_sample_t loss_sample = {
+	    .tx_in_flight = 1000,
+	    .tx_lost = tc->lost,
+	    .bytes = 1000,
+	  };
+	  tc->lost += loss_sample.bytes;
+	  tc->cc_algo->lost_sample (tc, &loss_sample);
+	  clib_memset (&ac, 0, sizeof (ac));
+	  tc->cc_algo->rcv_cong_ack (tc, TCP_CC_DUPACK, &ac);
+	  TCP_TEST (tc->cwnd < prior_cwnd,
+		    "bbr lost snapshot with a zero-length prefix still reduces cwnd (%u)",
+		    tc->cwnd);
+	}
+      tcp_test_bbr_cleanup (tc);
+    }
 
   /* Restarting an idle ProbeRTT flow must not start its dwell timer. The next
    * ACK starts the timer after the pipe is drained, so ProbeRTT remains active. */
@@ -7622,6 +7681,37 @@ tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
   tc->snd_una = tc->snd_nxt;
   TCP_TEST (ac->delivered == burst && ac->interval_time == 0.0,
 	    "sub-min-rtt rate sample should be invalid");
+
+  /* Previously accounted losses must not become interval loss again when
+   * an ACK repeats SACK coverage or retires already delivered bytes. */
+  scoreboard_clear (&tc->sack_sb);
+  bt->min_rtt = 0.0;
+  tc->lost = 1000;
+  snd_una = tc->snd_una;
+  tcp_test_set_time (thread_index, 14);
+  tcp_bt_track_tx (tc, 4 * burst);
+  tc->snd_nxt += 4 * burst;
+  block = (sack_block_t) { .start = snd_una + burst, .end = tc->snd_nxt };
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
+  tc->rcv_opts.n_sack_blocks = 1;
+  tcp_test_set_time (thread_index, 15);
+  tcp_test_rcv_sacks (tc, snd_una, ac);
+  TCP_TEST (ac->tx_in_flight == 4 * burst && ac->lost == burst,
+	    "valid SACK sample retains new interval loss (%u)", ac->lost);
+  tcp_test_rcv_sacks (tc, snd_una, ac);
+  TCP_TEST (!ac->acked_and_sacked && !ac->tx_in_flight && !ac->last_lost && !ac->lost,
+	    "repeated SACK does not report lifetime loss (%u)", ac->lost);
+
+  tcp_test_rcv_sacks (tc, snd_una + burst, ac);
+  tc->snd_una += burst;
+  vec_reset_length (tc->rcv_opts.sacks);
+  tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
+  tc->rcv_opts.n_sack_blocks = 0;
+  tcp_test_rcv_sacks (tc, tc->snd_nxt, ac);
+  tc->snd_una = tc->snd_nxt;
+  TCP_TEST (ac->bytes_acked == 3 * burst && !ac->acked_and_sacked && !ac->tx_in_flight && !ac->lost,
+	    "cumulative ACK of SACKed bytes does not report lifetime loss (%u)", ac->lost);
 
   /*
    * Cleanup

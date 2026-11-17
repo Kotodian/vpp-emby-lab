@@ -1282,7 +1282,10 @@ tcp_bt_sample_delivery_rate (tcp_connection_t *tc, tcp_ack_ctx_t *ac)
 
 done:
   ac->acked_and_sacked = delivered;
-  ac->lost = tc->lost - ac->tx_lost;
+  /* Repeated SACKs and ACKs of already delivered bytes select no transmit
+   * sample. The default zero loss baseline must not expose lifetime loss as
+   * a new measurement interval. */
+  ac->lost = ac->tx_in_flight ? tc->lost - ac->tx_lost : 0;
 }
 
 /* Advance the RFC 6675 loss boundary after new SACK coverage. Samples below
@@ -1351,7 +1354,7 @@ tcp_bt_loss_on_ack (tcp_connection_t *tc, tcp_ack_ctx_t *ac)
   ASSERT (ac->last_sacked_bytes);
   newly_lost = tcp_bt_update_sack_loss (tc, ac);
   tc->lost += newly_lost;
-  ac->lost = tc->lost - ac->tx_lost;
+  ac->lost = ac->tx_in_flight ? tc->lost - ac->tx_lost : 0;
 }
 
 void

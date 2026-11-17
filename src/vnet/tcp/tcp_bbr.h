@@ -575,7 +575,9 @@ bbr_adapt_lower_bounds (tcp_connection_t *tc, bbr_data_t *bd)
 static inline u8
 bbr_is_inflight_too_high (tcp_ack_ctx_t *rs)
 {
-  if (!rs->lost)
+  /* ACK-side loss without a transmit snapshot has no ratio denominator.
+   * Loss callbacks carry that snapshot even without a delivery-rate sample. */
+  if (!rs->lost || !rs->tx_in_flight)
     return 0;
   return (f64) rs->lost > (f64) rs->tx_in_flight * BBR_LOSS_THRESH;
 }

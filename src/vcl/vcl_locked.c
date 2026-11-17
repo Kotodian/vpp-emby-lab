@@ -1933,6 +1933,17 @@ vls_handle_pending_wrk_cleanup (void)
   if (PREDICT_TRUE (vec_len (vls_wrk->pending_vcl_wrk_cleanup) == 0))
     return;
 
+  /* Shared-worker poll/epoll callers can observe the same pending child.
+   * Serialize the entire fork-chain teardown with other pool/MQ operations,
+   * in the same order used when taking the fork snapshot. The loop must
+   * inspect the pending vector again after acquiring the locks. */
+  vls_mt_pool_wlock ();
+  if (vlsl->vls_mt_needs_locks)
+    {
+      vls_mt_mq_lock ();
+      vls_mt_spool_wlock ();
+    }
+
   wrk = vcl_worker_get_current ();
   vec_foreach (wip, vls_wrk->pending_vcl_wrk_cleanup)
     {
@@ -1942,6 +1953,8 @@ vls_handle_pending_wrk_cleanup (void)
       vls_cleanup_forked_child (wrk, child_wrk);
     }
   vec_reset_length (vls_wrk->pending_vcl_wrk_cleanup);
+  vls_mt_rel_locks ();
+  vls_mt_pool_wunlock ();
 }
 
 static void

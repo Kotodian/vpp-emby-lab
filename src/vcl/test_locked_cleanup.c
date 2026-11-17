@@ -2,6 +2,7 @@
 /* Reproduce fork cleanup after independent VCL/VLS worker pool reuse. The
  * private cleanup entry point is exercised without a VPP daemon or sockets. */
 #define _GNU_SOURCE
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/resource.h>
@@ -10,11 +11,13 @@
 
 static unsigned int checks, cleaned;
 static unsigned int flushed;
+static unsigned int concurrent_cleanup;
+static pthread_barrier_t cleanup_barrier;
 
 #define CHECK(expr)                                                                                \
   do                                                                                               \
     {                                                                                              \
-      checks++;                                                                                    \
+      __atomic_add_fetch (&checks, 1, __ATOMIC_RELAXED);                                           \
       if (!(expr))                                                                                 \
 	{                                                                                          \
 	  fprintf (stderr, "%s:%d: %s failed\n", __FILE__, __LINE__, #expr);                       \
@@ -29,9 +32,27 @@ void
 vcl_worker_cleanup (vcl_worker_t *wrk, u8 notify_vpp)
 {
   CHECK (notify_vpp == 0);
+  if (concurrent_cleanup)
+    {
+      CHECK ((vlspt->locks_acq & (VLS_MT_WLOCK_POOL | VLS_MT_LOCK_MQ | VLS_MT_WLOCK_SPOOL)) ==
+	     (VLS_MT_WLOCK_POOL | VLS_MT_LOCK_MQ | VLS_MT_WLOCK_SPOOL));
+      CHECK (pthread_mutex_trylock (&vlsl->vls_mt_mq_mlock) == EBUSY);
+      usleep (20000);
+    }
   cleaned++;
   clib_memset (wrk, 0xab, sizeof (*wrk));
   pool_put (vcm->workers, wrk);
+}
+
+static void *
+concurrent_reaper (void *arg)
+{
+  vcl_set_worker_index (0);
+  int rv = pthread_barrier_wait (&cleanup_barrier);
+  CHECK (rv == 0 || rv == PTHREAD_BARRIER_SERIAL_THREAD);
+  vls_handle_pending_wrk_cleanup ();
+  CHECK (vlspt->locks_acq == 0);
+  return 0;
 }
 
 void
@@ -128,6 +149,33 @@ main (void)
   CHECK (vlspt->locks_acq == 0);
   CHECK (pthread_mutex_trylock (&vlsl->vls_mt_mq_mlock) == 0);
   CHECK (pthread_mutex_unlock (&vlsl->vls_mt_mq_mlock) == 0);
+
+  /* Qt poll and the network thread's epoll can reap the same fork chain.
+   * Both core stacks freed the same child's sh_to_vlsh_table concurrently. */
+  child = new_vcl_worker ();
+  other = new_vcl_worker ();
+  parent->forked_child = child->wrk_index;
+  child->forked_child = other->wrk_index;
+  other->current_pid = INT_MAX;
+  for (u32 i = child->wrk_index; i <= other->wrk_index; i++)
+    {
+      vcl_set_worker_index (i);
+      child_vls = vls_worker_alloc ();
+      vls_sh_to_vlsh_table_add (child_vls, i << 24, 0);
+    }
+  vcl_set_worker_index (0);
+  vec_add1 (vls_worker_get_current ()->pending_vcl_wrk_cleanup, child->wrk_index);
+  concurrent_cleanup = 1;
+  pthread_t poller, epoller;
+  CHECK (pthread_barrier_init (&cleanup_barrier, 0, 2) == 0);
+  CHECK (pthread_create (&poller, 0, concurrent_reaper, 0) == 0);
+  CHECK (pthread_create (&epoller, 0, concurrent_reaper, 0) == 0);
+  CHECK (pthread_join (poller, 0) == 0);
+  CHECK (pthread_join (epoller, 0) == 0);
+  CHECK (cleaned == 6);
+  CHECK (pool_elts (vcm->workers) == 1 && pool_elts (vlsm->workers) == 1);
+  CHECK (vec_len (vls_worker_get_current ()->pending_vcl_wrk_cleanup) == 0);
+  CHECK (pthread_barrier_destroy (&cleanup_barrier) == 0);
   printf ("PASS: %u VLS fork cleanup checks\n", checks);
   return 0;
 }

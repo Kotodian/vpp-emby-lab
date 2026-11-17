@@ -4425,6 +4425,60 @@ done:
 static int
 tcp_test_rto (vlib_main_t *vm, unformat_input_t *input)
 {
+  /* Measurements from a WAN peer: low per-ACK variance must not make
+   * an ACK a few milliseconds late trigger timeout recovery. Exercise
+   * the real TCP timer wheel, including cancellation and genuine expiry. */
+  const struct
+  {
+    u32 srtt, rttvar;
+    f64 ack_after;
+  } paths[] = { { 218293, 322, 0.260 }, { 225786, 445, 0.230 }, { 1000, 1, 0.040 } };
+
+  for (u32 i = 0; i < ARRAY_LEN (paths); i++)
+    {
+      tcp_connection_t tc = {};
+      tcp_timer_wheel_t tw = { 0 };
+      u32 *expired;
+      int ok;
+
+      tc.connection.thread_index = vlib_get_thread_index ();
+      tc.snd_nxt = tc.snd_mss = 1388;
+      tc.srtt = paths[i].srtt;
+      tc.rttvar = paths[i].rttvar;
+      clib_memset (tc.timers, 0xff, sizeof (tc.timers));
+      tcp_update_rto (&tc);
+      tw_timer_wheel_init_tcp_twsl (&tw, 0, TCP_TIMER_TICK, ~0);
+      tw.last_run_time = 1.0;
+      tcp_retransmit_timer_set (&tw, &tc);
+      expired = tw_timer_expire_timers_tcp_twsl (&tw, 1.0 + paths[i].ack_after);
+      ok = TCP_TEST_I (vec_len (expired) == 0, "rto: ACK after %.1f ms precedes timeout on path %u",
+		       paths[i].ack_after * 1000, i);
+      if (ok)
+	{
+	  tcp_retransmit_timer_reset (&tw, &tc);
+	  expired = tw_timer_expire_timers_tcp_twsl (&tw, 2.0);
+	  ok = TCP_TEST_I (vec_len (expired) == 0, "rto: ACK cancels timeout on path %u", i);
+	}
+      if (ok)
+	{
+	  tcp_retransmit_timer_set (&tw, &tc);
+	  expired = tw_timer_expire_timers_tcp_twsl (&tw, 2.0 + (f64) tc.rto * TCP_TICK + 0.001);
+	  ok = TCP_TEST_I (vec_len (expired) == 1 && expired[0] == 0,
+			   "rto: missing ACK still expires the retransmit timer on path %u", i);
+	}
+      pool_free (tw.timers);
+      vec_free (tw.expired_timer_handles);
+      if (!ok)
+	return 1;
+    }
+
+  tcp_connection_t tc = { .srtt = 220000, .rttvar = 100000 };
+  tcp_update_rto (&tc);
+  TCP_TEST (tc.rto == 620000, "rto: retain larger measured variance");
+  tc.srtt = TCP_RTO_MAX - 100000;
+  tcp_update_rto (&tc);
+  TCP_TEST (tc.rto == TCP_RTO_MAX, "rto: retain maximum timeout bound");
+
   return tcp_test_rto_reduce_once_e2e (vm, input);
 }
 

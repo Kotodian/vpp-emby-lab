@@ -427,8 +427,10 @@ tcp_init_w_buffer (tcp_connection_t * tc, vlib_buffer_t * b, u8 is_ip4)
 always_inline void
 tcp_update_rto (tcp_connection_t * tc)
 {
-  tc->rto = clib_min (tc->srtt + (tc->rttvar << 2), TCP_RTO_MAX);
-  tc->rto = clib_max (tc->rto, TCP_RTO_MIN);
+  /* Keep a minimum uncertainty allowance above SRTT. Flooring only the
+   * total RTO allows a stable long-RTT path to time out almost at SRTT,
+   * before a delayed or reordered ACK can arrive. */
+  tc->rto = clib_min (tc->srtt + clib_max (tc->rttvar << 2, (u32) (TCP_RTO_MIN)), TCP_RTO_MAX);
 }
 
 always_inline u8

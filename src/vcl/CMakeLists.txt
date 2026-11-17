@@ -95,6 +95,12 @@ if(VPP_BUILD_VCL_TESTS)
     ENABLE_EXPORTS
     NO_INSTALL
   )
+  add_vpp_test(vcl_session_events_test
+    SOURCES test_session_events.c
+    LINK_LIBRARIES vppcom vppinfra svm dl pthread
+    ENABLE_EXPORTS
+    NO_INSTALL
+  )
 endif()
 endif()
 

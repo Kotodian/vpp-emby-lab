@@ -1887,6 +1887,16 @@ vcl_session_cleanup (vcl_worker_t * wrk, vcl_session_t * s,
 cleanup:
   vcl_session_table_del_vpp_handle (wrk, s->vpp_handle);
 free_session:
+  /* A shared-session close can skip the transport disconnect, but not the
+   * lifetime of a postponed disconnect/reset notification. Keep the pool slot
+   * until the event consumer releases it, as for a detached session above. */
+  if (s->flags & VCL_SESSION_F_PENDING_DISCONNECT)
+    {
+      s->session_state = VCL_STATE_CLOSED;
+      s->flags |= VCL_SESSION_F_PENDING_FREE;
+      return rv;
+    }
+
   vcl_session_free (wrk, s);
   vcl_evt (VCL_EVT_CLOSE, s, rv);
 
